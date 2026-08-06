@@ -1,4 +1,4 @@
-const CACHE = 'cy-traffic-v1';
+const CACHE = 'cy-traffic-v2';
 const SHELL = [
   './index.html',
   './manifest.json',
@@ -38,8 +38,28 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // App shell + map tiles: cache-first, so the app opens instantly even
-  // offline; refresh the cache in the background when online.
+  // App shell (our own files): network-first, so a reopen/reload always
+  // gets the current code — this is what used to serve stale versions for
+  // a cycle or two after every deploy. Falls back to cache only when
+  // actually offline. The shell is one small HTML file, so the network
+  // round-trip costs nothing worth trading freshness for.
+  if (url.startsWith(self.location.origin)) {
+    event.respondWith(
+      fetch(event.request)
+        .then((res) => {
+          if (res.ok) {
+            const clone = res.clone();
+            caches.open(CACHE).then((cache) => cache.put(event.request, clone));
+          }
+          return res;
+        })
+        .catch(() => caches.match(event.request))
+    );
+    return;
+  }
+
+  // Map tiles (cross-origin, from CartoDB): cache-first — heavy, static,
+  // safe and worth caching aggressively.
   event.respondWith(
     caches.match(event.request).then((cached) => {
       const network = fetch(event.request)

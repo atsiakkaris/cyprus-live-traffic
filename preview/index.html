@@ -42,17 +42,25 @@
     width: 36px; height: 4px; background: #ddd; border-radius: 2px;
     margin: 0 auto 14px;
   }
+  .sheet-close {
+    position: absolute; top: 10px; right: 14px;
+    width: 30px; height: 30px; border: none; background: none;
+    display: flex; align-items: center; justify-content: center;
+    color: #999; font-size: 20px; line-height: 1;
+  }
   .sheet-speed { font-size: 32px; font-weight: 700; }
   .sheet-speed .unit { font-size: 16px; font-weight: 500; color: #888; margin-left: 4px; }
   .sheet-nodata { font-size: 17px; color: #888; padding: 8px 0; }
 
+  /* Purely visual dimming — never intercepts touches, so the map stays
+     pannable/zoomable while the sheet is open. */
   .backdrop {
     position: fixed; inset: 0; z-index: 1500;
     background: rgba(0,0,0,0.15);
     opacity: 0; pointer-events: none;
     transition: opacity 220ms ease;
   }
-  .backdrop.open { opacity: 1; pointer-events: auto; }
+  .backdrop.open { opacity: 1; }
 
   .locate-btn {
     position: absolute; z-index: 1000;
@@ -87,11 +95,12 @@
   <div><span style="background:#2ecc71"></span>Fast &gt;60</div>
   <div><span style="background:#f1c40f"></span>Moderate 30–60</div>
   <div><span style="background:#e74c3c"></span>Slow &lt;30</div>
-  <div><span style="background:#95a5a6"></span>No data</div>
+  <div><span style="background:#95a5a6"></span>No data or malfunctioning sensors</div>
 </div>
 
 <div class="backdrop" id="backdrop"></div>
 <div class="sheet" id="sheet">
+  <button class="sheet-close" id="sheetClose" aria-label="Close">&times;</button>
   <div class="sheet-handle"></div>
   <div id="sheetBody"></div>
 </div>
@@ -114,7 +123,7 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r
 }).addTo(map);
 
 function colorFor(speed) {
-  if (speed == null) return '#95a5a6';
+  if (speed == null || speed < 0) return '#95a5a6'; // -1 = malfunctioning sensor
   if (speed > 60) return '#2ecc71';
   if (speed >= 30) return '#f1c40f';
   return '#e74c3c';
@@ -123,9 +132,10 @@ function colorFor(speed) {
 const sheet = document.getElementById('sheet');
 const backdrop = document.getElementById('backdrop');
 const sheetBody = document.getElementById('sheetBody');
+const sheetClose = document.getElementById('sheetClose');
 
 function openSheet(speed) {
-  sheetBody.innerHTML = speed != null
+  sheetBody.innerHTML = (speed != null && speed >= 0)
     ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>`
     : `<div class="sheet-nodata">No live data for this road</div>`;
   sheet.classList.add('open');
@@ -135,7 +145,12 @@ function closeSheet() {
   sheet.classList.remove('open');
   backdrop.classList.remove('open');
 }
-backdrop.addEventListener('click', closeSheet);
+sheetClose.addEventListener('click', closeSheet);
+// The backdrop no longer blocks touches (map must stay pannable/zoomable
+// while the sheet is open), so tapping empty map space is what now closes
+// it — each road's own click handler stops propagation so opening a sheet
+// doesn't immediately trigger this and close it again.
+map.on('click', closeSheet);
 
 const toastEl = document.getElementById('toast');
 let toastTimer;
@@ -182,30 +197,62 @@ map.on('locationerror', (e) => {
 // Try to center on the user as soon as the app opens, no tap required.
 doLocate();
 
-fetch('latest.json')
-  .then(r => r.json())
-  .then(data => {
-    const bounds = [];
-    data.paths.forEach(p => {
-      if (!p.coords || p.coords.length < 2) return;
-      const latlngs = p.coords.map(c => [c[0], c[1]]);
-      L.polyline(latlngs, {
-        color: colorFor(p.speed_kmh), weight: 5, opacity: 0.85,
-        // wider invisible hit area so thin roads are still easy to tap
-        interactive: true
-      })
-        .addTo(map)
-        .on('click', () => openSheet(p.speed_kmh));
-      latlngs.forEach(ll => bounds.push(ll));
+const DATA_URL = 'https://cyprus-live-traffic.tsiakkaris-andreas.workers.dev/latest.json';
+const REFRESH_INTERVAL_MS = 3 * 60 * 1000; // keep pace with the Worker's 5-min cron without over-fetching
+
+const layersById = new Map();
+let initialLoadDone = false;
+
+function loadData() {
+  return fetch(DATA_URL)
+    .then(r => r.json())
+    .then(data => {
+      const bounds = [];
+      data.paths.forEach(p => {
+        if (!p.coords || p.coords.length < 2) return;
+        const latlngs = p.coords.map(c => [c[0], c[1]]);
+        let entry = layersById.get(p.id);
+        if (entry) {
+          // Update in place — re-drawing 431 fresh polylines every refresh
+          // would flicker and drop whatever the user was mid-interaction
+          // with (e.g. an open bottom sheet).
+          entry.visible.setStyle({ color: colorFor(p.speed_kmh) });
+          entry.hit.speedKmh = p.speed_kmh;
+        } else {
+          // Two lines per road: a thin visible one (what you see) and a much
+          // wider invisible one on top of it (what actually catches taps) —
+          // the visible line alone is too thin a target to tap reliably,
+          // especially zoomed out.
+          const visible = L.polyline(latlngs, {
+            color: colorFor(p.speed_kmh), weight: 5, opacity: 0.85,
+            interactive: false
+          }).addTo(map);
+          const hit = L.polyline(latlngs, {
+            weight: 22, opacity: 0, interactive: true
+          }).addTo(map);
+          hit.speedKmh = p.speed_kmh;
+          hit.on('click', (e) => {
+            L.DomEvent.stopPropagation(e); // don't let this bubble to the map's own click-to-close handler
+            openSheet(hit.speedKmh);
+          });
+          entry = { visible, hit };
+          layersById.set(p.id, entry);
+        }
+        latlngs.forEach(ll => bounds.push(ll));
+      });
+      if (bounds.length && !initialLoadDone) {
+        initialLoadDone = true;
+        pathBounds = bounds;
+        if (locationOutcome === 'error') map.fitBounds(pathBounds, { padding: [20, 20] });
+      }
+    })
+    .catch(err => {
+      console.error('Failed to load latest.json:', err);
     });
-    if (bounds.length) {
-      pathBounds = bounds;
-      if (locationOutcome === 'error') map.fitBounds(pathBounds, { padding: [20, 20] });
-    }
-  })
-  .catch(err => {
-    console.error('Failed to load latest.json:', err);
-  });
+}
+
+loadData();
+setInterval(loadData, REFRESH_INTERVAL_MS);
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {

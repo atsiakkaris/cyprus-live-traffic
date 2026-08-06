@@ -1,0 +1,14 @@
+# Not required for the dashboard-paste deployment path (see README.md in
+# this folder) — this is here for reference / in case Node + wrangler ever
+# become available, so `wrangler deploy` works without reconstructing config.
+
+name = "cyprus-live-traffic"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "TRAFFIC_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
