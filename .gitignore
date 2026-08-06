@@ -2,4 +2,3 @@ __pycache__/
 *.pyc
 node_modules/
 .expo/
-poller/latest.json

@@ -104,7 +104,7 @@ function closeSheet() {
 }
 backdrop.addEventListener('click', closeSheet);
 
-fetch('../poller/latest.json')
+fetch('latest.json')
   .then(r => r.json())
   .then(data => {
     const bounds = [];

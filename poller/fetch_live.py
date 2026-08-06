@@ -18,7 +18,7 @@ BASE = "https://www.traffic4cyprus.org.cy/swarco3/api/Data"
 GEOMETRY_URL = f"{BASE}/PredefinedLocationPublication"
 LIVE_URL = f"{BASE}/PredefinedLocationDataPublication"
 
-OUT_PATH = Path(__file__).parent / "latest.json"
+OUT_PATH = Path(__file__).parent.parent / "preview" / "latest.json"
 
 
 def fetch(url):
