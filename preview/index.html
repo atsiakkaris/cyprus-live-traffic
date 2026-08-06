@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cyprus Live Traffic — Preview</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1a1a2e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body, #map { height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+
+  .legend {
+    position: absolute; z-index: 1000;
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    right: calc(env(safe-area-inset-right, 0px) + 12px);
+    background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 12px;
+    font-size: 13px; line-height: 1.9;
+    box-shadow: 0 2px 10px rgba(0,0,0,.18);
+  }
+  .legend div { display: flex; align-items: center; }
+  .legend span { display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; }
+
+  .leaflet-control-zoom { display: none; } /* pinch-to-zoom only, no mouse-style +/- buttons */
+
+  /* Bottom sheet */
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 2000;
+    background: white; border-radius: 20px 20px 0 0;
+    box-shadow: 0 -4px 20px rgba(0,0,0,.2);
+    padding: 10px 20px calc(env(safe-area-inset-bottom, 0px) + 24px);
+    transform: translateY(110%);
+    transition: transform 220ms ease;
+  }
+  .sheet.open { transform: translateY(0); }
+  .sheet-handle {
+    width: 36px; height: 4px; background: #ddd; border-radius: 2px;
+    margin: 0 auto 14px;
+  }
+  .sheet-speed { font-size: 32px; font-weight: 700; }
+  .sheet-speed .unit { font-size: 16px; font-weight: 500; color: #888; margin-left: 4px; }
+  .sheet-nodata { font-size: 17px; color: #888; padding: 8px 0; }
+
+  .backdrop {
+    position: fixed; inset: 0; z-index: 1500;
+    background: rgba(0,0,0,0.15);
+    opacity: 0; pointer-events: none;
+    transition: opacity 220ms ease;
+  }
+  .backdrop.open { opacity: 1; pointer-events: auto; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="legend">
+  <div><span style="background:#2ecc71"></span>Fast &gt;60</div>
+  <div><span style="background:#f1c40f"></span>Moderate 30–60</div>
+  <div><span style="background:#e74c3c"></span>Slow &lt;30</div>
+  <div><span style="background:#95a5a6"></span>No data</div>
+</div>
+
+<div class="backdrop" id="backdrop"></div>
+<div class="sheet" id="sheet">
+  <div class="sheet-handle"></div>
+  <div id="sheetBody"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map', { zoomControl: false, tap: true }).setView([35.05, 33.15], 9);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  subdomains: 'abcd',
+  maxZoom: 20
+}).addTo(map);
+
+function colorFor(speed) {
+  if (speed == null) return '#95a5a6';
+  if (speed > 60) return '#2ecc71';
+  if (speed >= 30) return '#f1c40f';
+  return '#e74c3c';
+}
+
+const sheet = document.getElementById('sheet');
+const backdrop = document.getElementById('backdrop');
+const sheetBody = document.getElementById('sheetBody');
+
+function openSheet(speed) {
+  sheetBody.innerHTML = speed != null
+    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>`
+    : `<div class="sheet-nodata">No live data for this road</div>`;
+  sheet.classList.add('open');
+  backdrop.classList.add('open');
+}
+function closeSheet() {
+  sheet.classList.remove('open');
+  backdrop.classList.remove('open');
+}
+backdrop.addEventListener('click', closeSheet);
+
+fetch('../poller/latest.json')
+  .then(r => r.json())
+  .then(data => {
+    const bounds = [];
+    data.paths.forEach(p => {
+      if (!p.coords || p.coords.length < 2) return;
+      const latlngs = p.coords.map(c => [c[0], c[1]]);
+      L.polyline(latlngs, {
+        color: colorFor(p.speed_kmh), weight: 5, opacity: 0.85,
+        // wider invisible hit area so thin roads are still easy to tap
+        interactive: true
+      })
+        .addTo(map)
+        .on('click', () => openSheet(p.speed_kmh));
+      latlngs.forEach(ll => bounds.push(ll));
+    });
+    if (bounds.length) map.fitBounds(bounds, { padding: [20, 20] });
+  })
+  .catch(err => {
+    console.error('Failed to load latest.json:', err);
+  });
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(err => console.error('SW registration failed:', err));
+  });
+}
+</script>
+</body>
+</html>
