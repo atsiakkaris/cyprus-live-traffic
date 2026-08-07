@@ -100,6 +100,39 @@ const JSON_HEADERS = {
   "Cache-Control": "no-store",
 };
 
+const DEPLOYED_HOST = "atsiakkaris.github.io";
+
+// Human-readable label for the Observability list view, e.g.
+// "App (atsiakkaris.github.io) — Chrome/Android" or "Local file test (browser) — Edge".
+// Categorizes by *what kind* of caller it is, not just the raw host, so it's obvious
+// at a glance whether a hit came from the real deployed app, local file:// testing,
+// a local dev server, or something unrecognized (e.g. curl, a bot, server-to-server).
+function describeCaller(request) {
+  const origin = request.headers.get("origin");
+  const referer = request.headers.get("referer");
+  const host = origin === "null" ? "file://" : origin ? new URL(origin).host : (referer ? new URL(referer).host : null);
+
+  let category;
+  if (host === DEPLOYED_HOST) category = `App (${DEPLOYED_HOST})`;
+  else if (host === "file://") category = "Local file test (browser)";
+  else if (host && /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) category = `Local dev server (${host})`;
+  else if (host) category = `Unknown site (${host})`;
+  else category = "Unknown source (no origin header)";
+
+  const ua = request.headers.get("user-agent") || "";
+  let browser = "unknown browser";
+  if (/EdgA\//.test(ua)) browser = "Edge/Android";
+  else if (/EdgiOS\//.test(ua)) browser = "Edge/iOS";
+  else if (/Edg\//.test(ua)) browser = "Edge";
+  else if (/Chrome\//.test(ua) && /Android/.test(ua)) browser = "Chrome/Android";
+  else if (/CriOS\//.test(ua)) browser = "Chrome/iOS";
+  else if (/Chrome\//.test(ua)) browser = "Chrome";
+  else if (/Firefox\//.test(ua)) browser = "Firefox";
+  else if (/Safari\//.test(ua)) browser = "Safari";
+
+  return `${category} — ${browser}`;
+}
+
 export default {
   async scheduled(event, env, ctx) {
     const snapshot = await buildSnapshot();
@@ -110,12 +143,14 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/refresh") {
+      console.log(`GET /refresh from ${describeCaller(request)}`);
       const snapshot = await buildSnapshot();
       await env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot));
       return new Response(JSON.stringify(snapshot), { headers: JSON_HEADERS });
     }
 
     if (url.pathname === "/latest.json" || url.pathname === "/") {
+      console.log(`GET /latest.json from ${describeCaller(request)}`);
       const cached = await env.TRAFFIC_KV.get("latest");
       if (!cached) {
         return new Response(

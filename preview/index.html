@@ -194,8 +194,13 @@ map.on('locationerror', (e) => {
   if (pathBounds) map.fitBounds(pathBounds, { padding: [20, 20] });
 });
 
-// Try to center on the user as soon as the app opens, no tap required.
-doLocate();
+// Try to center on the user as soon as the app opens, no tap required —
+// except on local file:// testing, where the page auto-reloads every few
+// minutes and re-centering/re-prompting for location each time would be
+// disruptive. The button is still there to trigger it manually there.
+if (location.protocol !== 'file:') {
+  doLocate();
+}
 
 const DATA_URL = 'https://cyprus-live-traffic.tsiakkaris-andreas.workers.dev/latest.json';
 const REFRESH_INTERVAL_MS = 3 * 60 * 1000; // keep pace with the Worker's 5-min cron without over-fetching
@@ -208,8 +213,10 @@ function loadData() {
     .then(r => r.json())
     .then(data => {
       const bounds = [];
+      const seenIds = new Set();
       data.paths.forEach(p => {
         if (!p.coords || p.coords.length < 2) return;
+        seenIds.add(p.id);
         const latlngs = p.coords.map(c => [c[0], c[1]]);
         let entry = layersById.get(p.id);
         if (entry) {
@@ -240,6 +247,19 @@ function loadData() {
         }
         latlngs.forEach(ll => bounds.push(ll));
       });
+
+      // Remove any road that no longer appears in the feed at all (retired
+      // upstream) — otherwise it lingers on the map forever, frozen at
+      // whatever color/data it last had, since the loop above only ever
+      // adds or updates, never deletes.
+      for (const [id, entry] of layersById) {
+        if (!seenIds.has(id)) {
+          map.removeLayer(entry.visible);
+          map.removeLayer(entry.hit);
+          layersById.delete(id);
+        }
+      }
+
       if (bounds.length && !initialLoadDone) {
         initialLoadDone = true;
         pathBounds = bounds;
@@ -252,7 +272,18 @@ function loadData() {
 }
 
 loadData();
-setInterval(loadData, REFRESH_INTERVAL_MS);
+
+if (location.protocol === 'file:') {
+  // Local file:// testing only: a full page reload already re-runs loadData()
+  // from scratch as the very first thing the script does on load, so this
+  // alone covers both "fetch fresh data" and "pick up code changes" —
+  // deterministically, since it's one action, not two independent timers
+  // racing each other. Never do this for the deployed app — it would reset
+  // a real user's map position and interrupt whatever they're looking at.
+  setInterval(() => location.reload(), REFRESH_INTERVAL_MS);
+} else {
+  setInterval(loadData, REFRESH_INTERVAL_MS);
+}
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
