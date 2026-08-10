@@ -1,6 +1,6 @@
-# Not required for the dashboard-paste deployment path (see README.md in
-# this folder) — this is here for reference / in case Node + wrangler ever
-# become available, so `wrangler deploy` works without reconstructing config.
+# Used by Cloudflare Workers Builds for git-connected auto-deploy on push
+# to main (see worker/README.md). wrangler deploy also works locally against
+# this config if Node + wrangler are ever set up.
 
 name = "cyprus-live-traffic"
 main = "worker.js"
@@ -9,6 +9,14 @@ compatibility_date = "2026-08-01"
 [triggers]
 crons = ["*/5 * * * *"]
 
+# Without this, a git-connected `wrangler deploy` resets Observability Logs to
+# disabled on every deploy (dashboard-only toggle, not wrangler's default) —
+# which is exactly what silently killed log visibility after the first
+# git-connected deploy despite cron continuing to run fine underneath.
+[observability.logs]
+enabled = true
+invocation_logs = true
+
 [[kv_namespaces]]
 binding = "TRAFFIC_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "1ccde47ff053431da42a59df1a0c0602"

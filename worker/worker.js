@@ -133,9 +133,21 @@ function describeCaller(request) {
   return `${category} — ${browser}`;
 }
 
+// Sanity floor for a healthy snapshot. Normal runs return ~429 paths; a
+// broken upstream fetch (e.g. an expired TLS cert causing a malformed or
+// empty response instead of a thrown error) can silently parse down to 0
+// with no exception raised at all. Refusing to write anything below this
+// floor means a bad upstream response degrades to "serve the last known
+// good snapshot" instead of wiping the live app blank for every user.
+const MIN_HEALTHY_PATH_COUNT = 50;
+
 export default {
   async scheduled(event, env, ctx) {
     const snapshot = await buildSnapshot();
+    if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
+      console.error(`Refusing to store suspicious snapshot: only ${snapshot.path_count} paths (upstream likely broken)`);
+      return;
+    }
     await env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot));
   },
 
@@ -145,6 +157,13 @@ export default {
     if (url.pathname === "/refresh") {
       console.log(`GET /refresh from ${describeCaller(request)}`);
       const snapshot = await buildSnapshot();
+      if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
+        console.error(`Refusing to store suspicious snapshot: only ${snapshot.path_count} paths (upstream likely broken)`);
+        return new Response(
+          JSON.stringify({ error: "Upstream returned a suspiciously empty/broken feed — last good snapshot kept.", ...snapshot }),
+          { status: 502, headers: JSON_HEADERS }
+        );
+      }
       await env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot));
       return new Response(JSON.stringify(snapshot), { headers: JSON_HEADERS });
     }
