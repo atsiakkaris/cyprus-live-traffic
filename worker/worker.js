@@ -10,6 +10,11 @@
 const BASE = "https://www.traffic4cyprus.org.cy/swarco3/api/Data";
 const GEOMETRY_URL = `${BASE}/PredefinedLocationPublication`;
 const LIVE_URL = `${BASE}/PredefinedLocationDataPublication`;
+const SITUATION_URL = `${BASE}/SituationPublication`;
+
+const FIXCYPRUS_BASE = "https://fixcyprus.cy/gnosis/open/api/nap/datasets";
+const WAZE_ALERTS_URL = `${FIXCYPRUS_BASE}/waze_alerts/`;
+const WAZE_TRAFFIC_URL = `${FIXCYPRUS_BASE}/waze_traffic/`;
 
 const BLOCK_RE = /<q1:predefinedLocationReference[^>]*\bid="([^"]+)"[^>]*>([\s\S]*?)<\/q1:predefinedLocationReference>/g;
 const NAME_RE = /<value lang="en-US">([^<]*)<\/value>/;
@@ -18,6 +23,34 @@ const COORDS_RE = /<gml:coordinates[^>]*>([\s\S]*?)<\/gml:coordinates>/;
 const SPEED_RE = /<obs_speed[^>]*>([^<]*)<\/obs_speed>/;
 const TTIME_RE = /<obs_t_time[^>]*>([^<]*)<\/obs_t_time>/;
 const TS_RE = /<measurement_timestamp[^>]*>([^<]*)<\/measurement_timestamp>/;
+
+// Waze feeds (waze_alerts, waze_traffic) share this DATEX II shape: repeated
+// <traffic:trafficElement> blocks, each with a free-form set of
+// commentType/value pairs (type, subtype, street, from, to, jamLevel,
+// report_time — never all present at once) plus a location block.
+const TRAFFIC_ELEMENT_RE = /<traffic:trafficElement>([\s\S]*?)<\/traffic:trafficElement>/g;
+const COMMENT_RE = /<common:commentType>([^<]*)<\/common:commentType>\s*<common:value>([^<]*)<\/common:value>/g;
+const POINT_COORDS_RE = /<location:pointCoordinates>\s*<common:latitude>([^<]*)<\/common:latitude>\s*<common:longitude>([^<]*)<\/common:longitude>\s*<\/location:pointCoordinates>/;
+const LAT_LON_RE = /<common:latitude>([^<]*)<\/common:latitude>\s*<common:longitude>([^<]*)<\/common:longitude>/g;
+
+// SituationPublication (road works, obstructions, lane closures): repeated
+// <q1:situationRecord> blocks with an xsi:type, severity, optional free-text
+// description, and a point location.
+const SITUATION_RECORD_RE = /<q1:situationRecord xsi:type="q1:([^"]+)"\s+id="([^"]+)"[^>]*>([\s\S]*?)<\/q1:situationRecord>/g;
+const SEVERITY_RE = /<q1:severity>([^<]*)<\/q1:severity>/;
+const DESCRIPTION_RE = /<description[^>]*>([^<]*)<\/description>/;
+// Each situationRecord declares its own incrementing XML namespace prefix
+// (q2, q3, q4, ...) for its locationReference, so the prefix on <N:latitude>
+// varies record to record — matched generically rather than pinned to "q2".
+const SITUATION_POINT_RE = /<\w+:latitude>([^<]*)<\/\w+:latitude>\s*<\w+:longitude>([^<]*)<\/\w+:longitude>/;
+const OVERALL_START_RE = /<overallStartTime>([^<]*)<\/overallStartTime>/;
+const OVERALL_END_RE = /<overallEndTime>([^<]*)<\/overallEndTime>/;
+
+function commentsOf(block) {
+  const comments = {};
+  for (const m of block.matchAll(COMMENT_RE)) comments[m[1]] = unescapeXml(m[2]);
+  return comments;
+}
 
 function unescapeXml(s) {
   return s
@@ -71,10 +104,109 @@ function parseLive(text) {
   return result;
 }
 
+// Alert subtypes excluded entirely — too noisy/low-value to show on the map.
+const EXCLUDED_ALERT_SUBTYPES = new Set(["HAZARD_ON_ROAD_POT_HOLE"]);
+
+// Waze crowdsourced point reports: road closures, hazards, jams. Each has a
+// type (and for HAZARD, a subtype), an optional street name, and when it was
+// reported — but never coordinates outside a single point.
+function parseWazeAlerts(text) {
+  const alerts = [];
+  for (const m of text.matchAll(TRAFFIC_ELEMENT_RE)) {
+    const block = m[1];
+    const idMatch = /<common:id>([^<]*)<\/common:id>/.exec(block);
+    const pointMatch = POINT_COORDS_RE.exec(block);
+    if (!idMatch || !pointMatch) continue;
+    const c = commentsOf(block);
+    if (c.subtype && EXCLUDED_ALERT_SUBTYPES.has(c.subtype)) continue;
+    alerts.push({
+      id: idMatch[1],
+      type: c.type || null,
+      subtype: c.subtype || null,
+      street: c.street || null,
+      report_time: c.report_time || null,
+      lat: parseFloat(pointMatch[1]),
+      lon: parseFloat(pointMatch[2]),
+    });
+  }
+  return alerts;
+}
+
+// Waze crowdsourced jam segments: a from/to road description, a 0–5 jamLevel,
+// and a line (start/intermediate/end points) rather than a single point.
+function parseWazeTraffic(text) {
+  const jams = [];
+  for (const m of text.matchAll(TRAFFIC_ELEMENT_RE)) {
+    const block = m[1];
+    const idMatch = /<common:id>([^<]*)<\/common:id>/.exec(block);
+    const linearMatch = /<location:linear>([\s\S]*?)<\/location:linear>/.exec(block);
+    if (!idMatch || !linearMatch) continue;
+    const coords = [...linearMatch[1].matchAll(LAT_LON_RE)]
+      .map((p) => [parseFloat(p[1]), parseFloat(p[2])])
+      .filter((p) => !Number.isNaN(p[0]) && !Number.isNaN(p[1]));
+    if (coords.length < 2) continue;
+    const c = commentsOf(block);
+    jams.push({
+      id: idMatch[1],
+      from: c.from || null,
+      to: c.to || null,
+      jam_level: c.jamLevel != null ? parseInt(c.jamLevel, 10) : null,
+      coords,
+    });
+  }
+  return jams;
+}
+
+// Road works / obstructions / lane management from the official feed —
+// distinct schema from the geometry/live feeds above (situation, not
+// predefinedLocation). Descriptions are frequently Greek-only free text.
+function parseSituations(text) {
+  const situations = [];
+  for (const m of text.matchAll(SITUATION_RECORD_RE)) {
+    const recordType = m[1];
+    const id = m[2];
+    const block = m[3];
+    const pointMatch = SITUATION_POINT_RE.exec(block);
+    if (!pointMatch) continue;
+    const severityMatch = SEVERITY_RE.exec(block);
+    const descMatch = DESCRIPTION_RE.exec(block);
+    const startMatch = OVERALL_START_RE.exec(block);
+    const endMatch = OVERALL_END_RE.exec(block);
+    situations.push({
+      id,
+      type: recordType,
+      severity: severityMatch ? severityMatch[1] : null,
+      description: descMatch ? unescapeXml(descMatch[1]) : null,
+      starts_at: startMatch ? startMatch[1] : null,
+      ends_at: endMatch ? endMatch[1] : null,
+      lat: parseFloat(pointMatch[1]),
+      lon: parseFloat(pointMatch[2]),
+    });
+  }
+  return situations;
+}
+
+// Fetches one feed and applies `parse`, but never lets a failure here take
+// down the whole snapshot — a broken/empty response from any one of these
+// degrades to an empty list instead of aborting buildSnapshot() entirely,
+// which would otherwise also wipe the core road-speed data on every refresh.
+async function fetchAndParse(url, parse, label) {
+  try {
+    const text = await fetch(url).then((r) => r.text());
+    return parse(text);
+  } catch (err) {
+    console.error(`Failed to fetch/parse ${label}: ${err}`);
+    return [];
+  }
+}
+
 async function buildSnapshot() {
-  const [geometryText, liveText] = await Promise.all([
+  const [geometryText, liveText, alerts, jams, situations] = await Promise.all([
     fetch(GEOMETRY_URL).then((r) => r.text()),
     fetch(LIVE_URL).then((r) => r.text()),
+    fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts"),
+    fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic"),
+    fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication"),
   ]);
 
   const geometry = parseGeometry(geometryText);
@@ -91,6 +223,9 @@ async function buildSnapshot() {
     path_count: paths.length,
     matched_live_count: paths.filter((p) => p.speed_kmh != null).length,
     paths,
+    alerts,
+    jams,
+    situations,
   };
 }
 

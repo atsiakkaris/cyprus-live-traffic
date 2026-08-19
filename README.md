@@ -26,16 +26,14 @@ dependency between them, by design.
   path (the Worker replaced it), but still useful for local testing/dev
   without needing the deployed Worker — writes `preview/latest.json`
   (gitignored) for the app to fall back to locally.
-- **`api/`** — not needed; the Worker's `/latest.json` route *is* the API.
-- **`app/`** — (not yet built) a React Native version, once/if this outgrows
-  a PWA — needs Node tooling this environment doesn't have.
 
 ## Deployment
 
 - **App:** GitHub Pages, serving from `main` / `/(root)`. Lives at
   `https://atsiakkaris.github.io/cyprus-live-traffic/preview/index.html`.
-- **Data:** Cloudflare Worker (see `worker/README.md` for setup) — deployed
-  via the Cloudflare dashboard, no local Node/wrangler needed.
+- **Data:** Cloudflare Worker (see `worker/README.md` for setup) — git-connected
+  via Cloudflare Workers Builds, so pushing to `main` auto-deploys `worker.js`
+  and `wrangler.toml`. No local Node/wrangler needed for day-to-day changes.
 
 ## Data source
 

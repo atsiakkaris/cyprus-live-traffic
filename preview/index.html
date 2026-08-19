@@ -76,6 +76,19 @@
   .locate-btn.locating svg { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
+  /* Sits inside the legend, below the swatch rows, rather than as a
+     separate floating control — one panel instead of two competing
+     for the same top-right corner. */
+  .events-toggle {
+    width: 100%; margin-top: 8px; padding-top: 8px;
+    border: none; border-top: 1px solid #ddd; background: none;
+    font-size: 13px; font-weight: 600; color: #999; font-family: inherit;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .events-toggle .dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; transition: background 150ms ease; }
+  .events-toggle.active { color: #1a1a2e; }
+  .events-toggle.active .dot { background: #2ecc71; }
+
   .toast {
     position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 90px);
     transform: translateX(-50%) translateY(10px);
@@ -86,6 +99,29 @@
     white-space: nowrap;
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* Point-report markers (Waze alerts, official road-works/incident situations) */
+  .leaflet-div-icon { background: transparent; border: none; }
+  .report-marker {
+    width: 30px; height: 30px; border-radius: 50%;
+    border: 2px solid white; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 17px; line-height: 1;
+  }
+
+  .legend .divider { height: 1px; background: #ddd; margin: 6px 0; }
+  .legend .swatch-line { width: 14px; height: 4px; border-radius: 2px; margin-right: 8px; }
+  /* Legend dots for point-report rows mirror the actual on-map marker: a
+     colored circle with the same symbol inside, not a plain color swatch. */
+  .legend .swatch-symbol {
+    width: 16px; height: 16px; border-radius: 50%; margin-right: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 10px; line-height: 1; color: white;
+  }
+
+  .sheet-title { font-size: 18px; font-weight: 700; }
+  .sheet-sub { font-size: 15px; color: #444; margin-top: 4px; }
+  .sheet-meta { font-size: 13px; color: #888; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -96,6 +132,14 @@
   <div><span style="background:#f1c40f"></span>Moderate 30–60</div>
   <div><span style="background:#e74c3c"></span>Slow &lt;30</div>
   <div><span style="background:#95a5a6"></span>No data or malfunctioning sensors</div>
+  <div class="divider"></div>
+  <div><span class="swatch-line" style="background:#e74c3c"></span>Crowdsourced jam</div>
+  <div><span class="swatch-symbol" style="background:#c0392b">🚫</span>Road closed</div>
+  <div><span class="swatch-symbol" style="background:#f39c12">⚠️</span>Hazard</div>
+  <div><span class="swatch-symbol" style="background:#e67e22">🚧</span>Road works</div>
+  <button class="events-toggle active" id="eventsToggle" aria-label="Toggle events">
+    <span class="dot"></span>Events
+  </button>
 </div>
 
 <div class="backdrop" id="backdrop"></div>
@@ -122,6 +166,18 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r
   maxZoom: 20
 }).addTo(map);
 
+// Alerts, jams, and situations all live in one group so a single toggle
+// shows/hides all three together — roads themselves are never affected.
+const eventsLayer = L.layerGroup().addTo(map);
+const eventsToggleBtn = document.getElementById('eventsToggle');
+let eventsVisible = true;
+eventsToggleBtn.addEventListener('click', () => {
+  eventsVisible = !eventsVisible;
+  eventsToggleBtn.classList.toggle('active', eventsVisible);
+  if (eventsVisible) map.addLayer(eventsLayer);
+  else map.removeLayer(eventsLayer);
+});
+
 function colorFor(speed) {
   if (speed == null || speed < 0) return '#95a5a6'; // -1 = malfunctioning sensor
   if (speed > 60) return '#2ecc71';
@@ -134,16 +190,99 @@ const backdrop = document.getElementById('backdrop');
 const sheetBody = document.getElementById('sheetBody');
 const sheetClose = document.getElementById('sheetClose');
 
-function openSheet(speed) {
-  sheetBody.innerHTML = (speed != null && speed >= 0)
-    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>`
-    : `<div class="sheet-nodata">No live data for this road</div>`;
+function showSheet() {
   sheet.classList.add('open');
   backdrop.classList.add('open');
 }
 function closeSheet() {
   sheet.classList.remove('open');
   backdrop.classList.remove('open');
+}
+function openSheet(speed) {
+  sheetBody.innerHTML = (speed != null && speed >= 0)
+    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>`
+    : `<div class="sheet-nodata">No live data for this road</div>`;
+  showSheet();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+// Waze alert type -> marker color/symbol. Unrecognized types (Waze adds new
+// ones occasionally) fall back to a generic gray marker rather than being
+// silently dropped, so a new type is still visible, just unstyled.
+function alertStyle(type) {
+  return {
+    ROAD_CLOSED: { color: '#c0392b', symbol: '🚫', label: 'Road closed' },
+    HAZARD: { color: '#f39c12', symbol: '⚠️', label: 'Hazard' },
+    JAM: { color: '#8e44ad', symbol: '🚗', label: 'Jam' },
+  }[type] || { color: '#7f8c8d', symbol: '!', label: type || 'Report' };
+}
+
+// Official situation record type -> marker color/symbol, grouped by what it
+// visually means to a driver rather than the raw DATEX II record type name.
+function situationStyle(type) {
+  if (type === 'VehicleObstruction') return { color: '#c0392b', symbol: '⛔', label: 'Obstruction' };
+  if (type === 'GenericSituationRecord') return { color: '#7f8c8d', symbol: '❗', label: 'Incident' };
+  return { color: '#e67e22', symbol: '🚧', label: 'Road works' }; // Maintenance/Construction/LaneManagement
+}
+
+function jamColor(level) {
+  if (level >= 5) return '#7b0000';
+  if (level >= 4) return '#c0392b';
+  if (level >= 3) return '#e67e22';
+  if (level >= 2) return '#f1c40f';
+  return '#f39c12'; // level 1
+}
+
+function reportMarker(lat, lon, color, symbol, onClick) {
+  const marker = L.marker([lat, lon], {
+    icon: L.divIcon({
+      className: '', iconSize: [30, 30], iconAnchor: [15, 15],
+      html: `<div class="report-marker" style="background:${color}">${symbol}</div>`,
+    }),
+  }).addTo(eventsLayer);
+  marker.on('click', (e) => {
+    L.DomEvent.stopPropagation(e);
+    onClick();
+  });
+  return marker;
+}
+
+function openAlertSheet(a) {
+  const s = alertStyle(a.type);
+  const sub = a.subtype ? escapeHtml(a.subtype.replace(/_/g, ' ').toLowerCase()) : '';
+  sheetBody.innerHTML = `
+    <div class="sheet-title">${s.symbol} ${s.label}${sub ? ' — ' + sub : ''}</div>
+    ${a.street ? `<div class="sheet-sub">${escapeHtml(a.street)}</div>` : ''}
+    ${a.report_time ? `<div class="sheet-meta">Reported ${escapeHtml(a.report_time)}</div>` : ''}
+  `;
+  showSheet();
+}
+
+function openJamSheet(j) {
+  sheetBody.innerHTML = `
+    <div class="sheet-title">🚗 Crowdsourced jam</div>
+    ${j.from || j.to ? `<div class="sheet-sub">${escapeHtml(j.from || '')}${j.from && j.to ? ' → ' : ''}${escapeHtml(j.to || '')}</div>` : ''}
+    <div class="sheet-meta">Jam level ${j.jam_level}/5</div>
+  `;
+  showSheet();
+}
+
+function openSituationSheet(sit) {
+  const s = situationStyle(sit.type);
+  const period = sit.starts_at
+    ? `${escapeHtml(sit.starts_at.replace('T', ' '))}${sit.ends_at ? ' – ' + escapeHtml(sit.ends_at.replace('T', ' ')) : ''}`
+    : '';
+  sheetBody.innerHTML = `
+    <div class="sheet-title">${s.symbol} ${s.label}</div>
+    ${sit.description ? `<div class="sheet-sub">${escapeHtml(sit.description)}</div>` : ''}
+    ${period ? `<div class="sheet-meta">${period}</div>` : ''}
+  `;
+  showSheet();
 }
 sheetClose.addEventListener('click', closeSheet);
 // The backdrop no longer blocks touches (map must stay pannable/zoomable
@@ -206,6 +345,9 @@ const DATA_URL = 'https://cyprus-live-traffic.tsiakkaris-andreas.workers.dev/lat
 const REFRESH_INTERVAL_MS = 3 * 60 * 1000; // keep pace with the Worker's 5-min cron without over-fetching
 
 const layersById = new Map();
+const alertsById = new Map();
+const jamsById = new Map();
+const situationsById = new Map();
 let initialLoadDone = false;
 
 function loadData() {
@@ -257,6 +399,69 @@ function loadData() {
           map.removeLayer(entry.visible);
           map.removeLayer(entry.hit);
           layersById.delete(id);
+        }
+      }
+
+      // Waze crowdsourced point reports: road closures, hazards, jams.
+      const seenAlertIds = new Set();
+      (data.alerts || []).forEach(a => {
+        if (a.lat == null || a.lon == null) return;
+        seenAlertIds.add(a.id);
+        if (alertsById.has(a.id)) return; // reports are immutable snapshots, nothing to update in place
+        const s = alertStyle(a.type);
+        const marker = reportMarker(a.lat, a.lon, s.color, s.symbol, () => openAlertSheet(a));
+        alertsById.set(a.id, marker);
+      });
+      for (const [id, marker] of alertsById) {
+        if (!seenAlertIds.has(id)) {
+          eventsLayer.removeLayer(marker);
+          alertsById.delete(id);
+        }
+      }
+
+      // Waze crowdsourced jam segments — only levels 1+ are drawn; a
+      // segment that drops back to level 0 is treated as "gone" so it
+      // gets cleaned up by the pass below, same as a road that vanishes.
+      const seenJamIds = new Set();
+      (data.jams || []).forEach(j => {
+        if (!j.coords || j.coords.length < 2 || !j.jam_level) return;
+        seenJamIds.add(j.id);
+        const latlngs = j.coords.map(c => [c[0], c[1]]);
+        let line = jamsById.get(j.id);
+        if (line) {
+          line.setStyle({ color: jamColor(j.jam_level) });
+          line.jamData = j;
+        } else {
+          line = L.polyline(latlngs, { color: jamColor(j.jam_level), weight: 6, opacity: 0.8 }).addTo(eventsLayer);
+          line.jamData = j;
+          line.on('click', (e) => {
+            L.DomEvent.stopPropagation(e);
+            openJamSheet(line.jamData);
+          });
+          jamsById.set(j.id, line);
+        }
+      });
+      for (const [id, line] of jamsById) {
+        if (!seenJamIds.has(id)) {
+          eventsLayer.removeLayer(line);
+          jamsById.delete(id);
+        }
+      }
+
+      // Official road-works/incident situations (SituationPublication).
+      const seenSituationIds = new Set();
+      (data.situations || []).forEach(sit => {
+        if (sit.lat == null || sit.lon == null) return;
+        seenSituationIds.add(sit.id);
+        if (situationsById.has(sit.id)) return; // same rationale as alerts above
+        const s = situationStyle(sit.type);
+        const marker = reportMarker(sit.lat, sit.lon, s.color, s.symbol, () => openSituationSheet(sit));
+        situationsById.set(sit.id, marker);
+      });
+      for (const [id, marker] of situationsById) {
+        if (!seenSituationIds.has(id)) {
+          eventsLayer.removeLayer(marker);
+          situationsById.delete(id);
         }
       }
 
