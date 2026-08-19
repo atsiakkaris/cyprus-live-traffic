@@ -10,21 +10,48 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body, #map { height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 
-  .legend {
+  /* Holds the legend and the events toggle as two separate stacked panels
+     (not merged into one box) — this wrapper owns the shared top-right
+     positioning so the toggle always sits directly under the legend
+     regardless of whether the legend is collapsed or expanded. */
+  .legend-wrap {
     position: absolute; z-index: 1000;
     top: calc(env(safe-area-inset-top, 0px) + 12px);
     right: calc(env(safe-area-inset-right, 0px) + 12px);
+    display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+  }
+
+  .legend {
     background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 12px;
     font-size: 13px; line-height: 1.9;
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
+    max-width: 220px;
   }
   .legend div { display: flex; align-items: center; }
   .legend span { display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; }
+
+  .legend-header {
+    display: flex; align-items: center; justify-content: space-between;
+    font-weight: 600; cursor: pointer; user-select: none;
+  }
+  .legend-header .chevron { transition: transform 150ms ease; }
+  .legend.collapsed .legend-header .chevron { transform: rotate(-90deg); }
+  .legend .legend-body {
+    display: block; /* .legend div{display:flex} would otherwise turn this
+      wrapper itself into a row flex container, laying its row children out
+      side-by-side instead of stacked */
+    overflow: hidden; max-height: 400px;
+    transition: max-height 200ms ease, opacity 150ms ease, margin-top 200ms ease;
+    margin-top: 6px; opacity: 1;
+  }
+  .legend.collapsed .legend-body { max-height: 0; opacity: 0; margin-top: 0; }
 
   .leaflet-control-zoom { display: none; } /* pinch-to-zoom only, no mouse-style +/- buttons */
 
@@ -76,18 +103,38 @@
   .locate-btn.locating svg { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* Sits inside the legend, below the swatch rows, rather than as a
-     separate floating control — one panel instead of two competing
-     for the same top-right corner. */
-  .events-toggle {
-    width: 100%; margin-top: 8px; padding-top: 8px;
-    border: none; border-top: 1px solid #ddd; background: none;
-    font-size: 13px; font-weight: 600; color: #999; font-family: inherit;
-    display: flex; align-items: center; gap: 6px;
+  /* Its own separate panel, not merged into the legend box — stacked below
+     it by .legend-wrap instead. Three independent chips (rather than one
+     all-or-nothing toggle) so e.g. road works can stay on while hazard
+     noise stays off. */
+  .filter-row { display: flex; gap: 8px; }
+  .filter-toggle {
+    background: rgba(255,255,255,0.95); border: none; border-radius: 22px;
+    width: 44px; height: 44px; font-size: 17px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.18);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0.4; transition: opacity 150ms ease;
   }
-  .events-toggle .dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; transition: background 150ms ease; }
-  .events-toggle.active { color: #1a1a2e; }
-  .events-toggle.active .dot { background: #2ecc71; }
+  .filter-toggle.active { opacity: 1; }
+
+  .freshness {
+    position: absolute; z-index: 1000;
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    left: calc(env(safe-area-inset-left, 0px) + 12px);
+    background: rgba(255,255,255,0.95); padding: 6px 12px; border-radius: 20px;
+    font-size: 12px; color: #888;
+    box-shadow: 0 2px 10px rgba(0,0,0,.18);
+  }
+  .freshness.stale { color: #c0392b; font-weight: 600; }
+
+  /* Lives inside the legend header instead of as a fourth separate floating
+     chip — it only matters when you're already looking at legend colors. */
+  .legend-header-actions { display: flex; align-items: center; gap: 8px; }
+  .cvd-toggle {
+    background: none; border: none; padding: 4px; font-size: 14px;
+    opacity: 0.4; line-height: 1;
+  }
+  .cvd-toggle.active { opacity: 1; }
 
   .toast {
     position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 90px);
@@ -122,24 +169,82 @@
   .sheet-title { font-size: 18px; font-weight: 700; }
   .sheet-sub { font-size: 15px; color: #444; margin-top: 4px; }
   .sheet-meta { font-size: 13px; color: #888; margin-top: 8px; }
+
+  .loading-overlay {
+    position: absolute; inset: 0; z-index: 1800;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,0.5);
+    opacity: 1; transition: opacity 250ms ease;
+    pointer-events: none;
+  }
+  .loading-overlay.hidden { opacity: 0; }
+  .spinner {
+    width: 36px; height: 36px; border-radius: 50%;
+    border: 4px solid rgba(0,0,0,0.15); border-top-color: #1a1a2e;
+    animation: spin 1s linear infinite;
+  }
+
+  /* Recolor markercluster's default blue/yellow/orange badges to match the
+     app's white-pill aesthetic instead of looking like an unstyled plugin. */
+  .marker-cluster { background: rgba(255,255,255,0.7) !important; }
+  .marker-cluster div {
+    background: rgba(26,26,46,0.92) !important;
+    color: white; font-weight: 600; font-size: 12px;
+  }
+  .marker-cluster span { color: white; }
+
+  @media (prefers-color-scheme: dark) {
+    .legend, .freshness, .filter-toggle, .sheet, .locate-btn {
+      background: rgba(30,30,36,0.95); color: #eee;
+    }
+    .legend-header { color: #eee; }
+    .legend .divider { background: #444; }
+    .sheet-handle { background: #555; }
+    .sheet-sub { color: #ccc; }
+    .sheet-close { color: #aaa; }
+    .sheet-speed .unit { color: #aaa; }
+    .freshness { color: #aaa; }
+    .freshness.stale { color: #ff7675; }
+    .locate-btn:active { background: #3a3a42; }
+    .locate-btn svg { stroke: #eee; }
+    .loading-overlay { background: rgba(20,20,24,0.5); }
+  }
 </style>
 </head>
 <body>
 <div id="map"></div>
+<div class="loading-overlay" id="loadingOverlay"><div class="spinner"></div></div>
 
-<div class="legend">
-  <div><span style="background:#2ecc71"></span>Fast &gt;60</div>
-  <div><span style="background:#f1c40f"></span>Moderate 30–60</div>
-  <div><span style="background:#e74c3c"></span>Slow &lt;30</div>
-  <div><span style="background:#95a5a6"></span>No data or malfunctioning sensors</div>
-  <div class="divider"></div>
-  <div><span class="swatch-line" style="background:#e74c3c"></span>Crowdsourced jam</div>
-  <div><span class="swatch-symbol" style="background:#c0392b">🚫</span>Road closed</div>
-  <div><span class="swatch-symbol" style="background:#f39c12">⚠️</span>Hazard</div>
-  <div><span class="swatch-symbol" style="background:#e67e22">🚧</span>Road works</div>
-  <button class="events-toggle active" id="eventsToggle" aria-label="Toggle events">
-    <span class="dot"></span>Events
-  </button>
+<div class="freshness" id="freshness"></div>
+
+<div class="legend-wrap">
+  <div class="legend collapsed" id="legend">
+    <div class="legend-header" id="legendHeader">
+      <span>Legend</span>
+      <span class="legend-header-actions">
+        <button class="cvd-toggle" id="cvdToggle" aria-label="Toggle colorblind-friendly colors">🎨</button>
+        <span class="chevron">▾</span>
+      </span>
+    </div>
+    <div class="legend-body">
+      <div><span id="legendFast" style="background:#2ecc71"></span>Fast &gt;60</div>
+      <div><span id="legendModerate" style="background:#f1c40f"></span>Moderate 30–60</div>
+      <div><span id="legendSlow" style="background:#e74c3c"></span>Slow &lt;30</div>
+      <div><span style="background:#95a5a6"></span>No data</div>
+      <div class="divider"></div>
+      <div><span class="swatch-line" style="background:#9d4edd"></span>Crowdsourced jam</div>
+      <div><span class="swatch-symbol" style="background:#c0392b">🚫</span>Road closed</div>
+      <div><span class="swatch-symbol" style="background:#f39c12">⚠️</span>Hazard</div>
+      <div><span class="swatch-symbol" style="background:#d90429">💥</span>Accident</div>
+      <div><span class="swatch-symbol" style="background:#e67e22">🚧</span>Road works</div>
+    </div>
+  </div>
+  <div class="filter-row">
+    <button class="filter-toggle" id="filterClosures" data-filter="closures" aria-label="Toggle road closures">🚫</button>
+    <button class="filter-toggle" id="filterHazards" data-filter="hazards" aria-label="Toggle hazards and accidents">⚠️</button>
+    <button class="filter-toggle" id="filterJams" data-filter="jams" aria-label="Toggle crowdsourced jams">🚗</button>
+    <button class="filter-toggle" id="filterWorks" data-filter="works" aria-label="Toggle road works">🚧</button>
+  </div>
 </div>
 
 <div class="backdrop" id="backdrop"></div>
@@ -158,32 +263,98 @@
 <div class="toast" id="toast"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>
-const map = L.map('map', { zoomControl: false, tap: true }).setView([35.05, 33.15], 9);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+// Canvas instead of the SVG default: with 429 roads x 2 lines each plus jam
+// segments, canvas rendering keeps pan/zoom noticeably smoother on phones.
+const map = L.map('map', { zoomControl: false, tap: true, renderer: L.canvas() }).setView([35.05, 33.15], 9);
+// CARTO's dark basemap in place of Voyager when the OS is in dark mode —
+// checked once at load rather than watched live, since switching tile sets
+// under a user mid-session would be jarring.
+const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+L.tileLayer(`https://{s}.basemaps.cartocdn.com/${prefersDark ? 'dark_all' : 'rastertiles/voyager'}/{z}/{x}/{y}{r}.png`, {
   attribution: '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
   subdomains: 'abcd',
   maxZoom: 20
 }).addTo(map);
 
-// Alerts, jams, and situations all live in one group so a single toggle
-// shows/hides all three together — roads themselves are never affected.
-const eventsLayer = L.layerGroup().addTo(map);
-const eventsToggleBtn = document.getElementById('eventsToggle');
-let eventsVisible = true;
-eventsToggleBtn.addEventListener('click', () => {
-  eventsVisible = !eventsVisible;
-  eventsToggleBtn.classList.toggle('active', eventsVisible);
-  if (eventsVisible) map.addLayer(eventsLayer);
-  else map.removeLayer(eventsLayer);
+// Starts collapsed so it doesn't eat phone screen space by default — tap
+// the header to expand. Doesn't stop event propagation to the map's own
+// click-to-close handler since the legend sits outside the map element.
+const legend = document.getElementById('legend');
+document.getElementById('legendHeader').addEventListener('click', () => {
+  legend.classList.toggle('collapsed');
 });
 
+// Four independent layer groups instead of one — road closures, hazards
+// (including accidents), jams (both crowdsourced jam reports and jam-level
+// line segments), and official road works, each with its own toggle chip.
+// All start hidden: at low zoom, 100+ large markers visually bury the thin
+// road lines underneath them, making the map look broken/empty of roads on
+// first open — opt-in per category instead of one all-or-nothing switch.
+//
+// Closures, hazards, and works are pure point markers, so they cluster at
+// low zoom instead of carpeting the map. Jams stays a plain layer group
+// since it mixes JAM-type markers with polyline segments — markerClusterGroup
+// only clusters L.Marker instances — and jam counts are typically low
+// enough that clustering wouldn't help anyway.
+const filterLayers = {
+  closures: L.markerClusterGroup({ maxClusterRadius: 50 }),
+  hazards: L.markerClusterGroup({ maxClusterRadius: 50 }),
+  jams: L.layerGroup(),
+  works: L.markerClusterGroup({ maxClusterRadius: 50 }),
+};
+const filterVisible = { closures: false, hazards: false, jams: false, works: false };
+document.querySelectorAll('.filter-toggle').forEach((btn) => {
+  const key = btn.dataset.filter;
+  btn.addEventListener('click', () => {
+    filterVisible[key] = !filterVisible[key];
+    btn.classList.toggle('active', filterVisible[key]);
+    if (filterVisible[key]) map.addLayer(filterLayers[key]);
+    else map.removeLayer(filterLayers[key]);
+  });
+});
+
+// Default is a standard red/yellow/green scale, indistinguishable for
+// red-green colorblind users (the most common form). The alternate is an
+// Okabe-Ito-style blue/orange/black scale, safe across all common types of
+// color vision deficiency, without needing to redesign the whole UI around
+// patterns/textures instead of color.
+const PALETTES = {
+  normal: { fast: '#2ecc71', moderate: '#f1c40f', slow: '#e74c3c' },
+  cvd: { fast: '#0072B2', moderate: '#E69F00', slow: '#000000' },
+};
+let colorblindMode = false;
+
 function colorFor(speed) {
-  if (speed == null || speed < 0) return '#95a5a6'; // -1 = malfunctioning sensor
-  if (speed > 60) return '#2ecc71';
-  if (speed >= 30) return '#f1c40f';
-  return '#e74c3c';
+  const p = colorblindMode ? PALETTES.cvd : PALETTES.normal;
+  if (speed == null || speed < 0) return '#95a5a6'; // -1 = malfunctioning sensor, same in both palettes
+  if (speed > 60) return p.fast;
+  if (speed >= 30) return p.moderate;
+  return p.slow;
 }
+
+const cvdToggleBtn = document.getElementById('cvdToggle');
+const legendFastEl = document.getElementById('legendFast');
+const legendModerateEl = document.getElementById('legendModerate');
+const legendSlowEl = document.getElementById('legendSlow');
+function applyPaletteToLegend() {
+  const p = colorblindMode ? PALETTES.cvd : PALETTES.normal;
+  legendFastEl.style.background = p.fast;
+  legendModerateEl.style.background = p.moderate;
+  legendSlowEl.style.background = p.slow;
+}
+cvdToggleBtn.addEventListener('click', (e) => {
+  e.stopPropagation(); // lives inside the legend header — don't also toggle collapse
+  colorblindMode = !colorblindMode;
+  cvdToggleBtn.classList.toggle('active', colorblindMode);
+  applyPaletteToLegend();
+  // Recolor every already-drawn road in place — a fresh loadData() would
+  // also pick up the new palette, but that's up to 3 minutes away.
+  for (const entry of layersById.values()) {
+    entry.visible.setStyle({ color: colorFor(entry.hit.speedKmh) });
+  }
+});
 
 const sheet = document.getElementById('sheet');
 const backdrop = document.getElementById('backdrop');
@@ -198,9 +369,41 @@ function closeSheet() {
   sheet.classList.remove('open');
   backdrop.classList.remove('open');
 }
-function openSheet(speed) {
+
+// Swipe-down-to-dismiss — tap-only felt dated for a bottom sheet. Follows
+// the finger while dragging downward, snaps closed past a threshold or
+// back to open otherwise; upward drags are ignored (nothing to reveal above
+// the sheet's resting position).
+let sheetDragStartY = null;
+let sheetDragDelta = 0;
+sheet.addEventListener('touchstart', (e) => {
+  sheetDragStartY = e.touches[0].clientY;
+  sheet.style.transition = 'none';
+}, { passive: true });
+sheet.addEventListener('touchmove', (e) => {
+  if (sheetDragStartY == null) return;
+  const dy = e.touches[0].clientY - sheetDragStartY;
+  if (dy > 0) {
+    sheetDragDelta = dy;
+    sheet.style.transform = `translateY(${dy}px)`;
+  }
+}, { passive: true });
+sheet.addEventListener('touchend', () => {
+  sheet.style.transition = '';
+  sheet.style.transform = '';
+  if (sheetDragDelta > 80) closeSheet();
+  sheetDragStartY = null;
+  sheetDragDelta = 0;
+});
+function formatTravelTime(seconds) {
+  if (seconds == null || seconds < 0) return null;
+  return seconds < 60 ? `${Math.round(seconds)} sec` : `${Math.round(seconds / 60)} min`;
+}
+
+function openSheet(speed, travelTimeS) {
+  const travel = formatTravelTime(travelTimeS);
   sheetBody.innerHTML = (speed != null && speed >= 0)
-    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>`
+    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>${travel ? `<div class="sheet-meta">~${travel} travel time</div>` : ''}`
     : `<div class="sheet-nodata">No live data for this road</div>`;
   showSheet();
 }
@@ -218,6 +421,7 @@ function alertStyle(type) {
   return {
     ROAD_CLOSED: { color: '#c0392b', symbol: '🚫', label: 'Road closed' },
     HAZARD: { color: '#f39c12', symbol: '⚠️', label: 'Hazard' },
+    ACCIDENT: { color: '#d90429', symbol: '💥', label: 'Accident' },
     JAM: { color: '#8e44ad', symbol: '🚗', label: 'Jam' },
   }[type] || { color: '#7f8c8d', symbol: '!', label: type || 'Report' };
 }
@@ -230,21 +434,25 @@ function situationStyle(type) {
   return { color: '#e67e22', symbol: '🚧', label: 'Road works' }; // Maintenance/Construction/LaneManagement
 }
 
+// A purple/magenta gradient rather than red/orange — jam severity and road
+// speed are different measurements, so overlapping both on the same
+// red-orange-yellow scale made a red road and a red jam read as "the same
+// kind of bad" at a glance even though they mean different things.
 function jamColor(level) {
-  if (level >= 5) return '#7b0000';
-  if (level >= 4) return '#c0392b';
-  if (level >= 3) return '#e67e22';
-  if (level >= 2) return '#f1c40f';
-  return '#f39c12'; // level 1
+  if (level >= 5) return '#5a189a';
+  if (level >= 4) return '#7b2cbf';
+  if (level >= 3) return '#9d4edd';
+  if (level >= 2) return '#c77dff';
+  return '#e0aaff'; // level 1
 }
 
-function reportMarker(lat, lon, color, symbol, onClick) {
+function reportMarker(lat, lon, color, symbol, onClick, targetLayer) {
   const marker = L.marker([lat, lon], {
     icon: L.divIcon({
       className: '', iconSize: [30, 30], iconAnchor: [15, 15],
       html: `<div class="report-marker" style="background:${color}">${symbol}</div>`,
     }),
-  }).addTo(eventsLayer);
+  }).addTo(targetLayer);
   marker.on('click', (e) => {
     L.DomEvent.stopPropagation(e);
     onClick();
@@ -344,16 +552,44 @@ if (location.protocol !== 'file:') {
 const DATA_URL = 'https://cyprus-live-traffic.tsiakkaris-andreas.workers.dev/latest.json';
 const REFRESH_INTERVAL_MS = 3 * 60 * 1000; // keep pace with the Worker's 5-min cron without over-fetching
 
+// Hidden the moment the first fetch settles, success or failure — a fetch
+// error already gets its own toast, so this just stops the spinner from
+// spinning forever rather than adding a second error surface.
+const loadingOverlay = document.getElementById('loadingOverlay');
+let firstLoadSettled = false;
+function hideLoadingOverlay() {
+  if (firstLoadSettled) return;
+  firstLoadSettled = true;
+  loadingOverlay.classList.add('hidden');
+}
+
 const layersById = new Map();
 const alertsById = new Map();
 const jamsById = new Map();
 const situationsById = new Map();
 let initialLoadDone = false;
 
+// Flags data as stale at 2x the refresh interval — by then a normal refresh
+// should have landed, so still showing the old timestamp means something's
+// actually wrong upstream (as opposed to just "a couple minutes old").
+const freshnessEl = document.getElementById('freshness');
+let lastGeneratedAt = null;
+function updateFreshnessLabel() {
+  if (!lastGeneratedAt) return;
+  const mins = Math.floor((Date.now() - lastGeneratedAt.getTime()) / 60000);
+  const text = mins < 1 ? 'Updated just now' : `Updated ${mins} min ago`;
+  freshnessEl.textContent = text;
+  freshnessEl.classList.toggle('stale', mins * 60000 > REFRESH_INTERVAL_MS * 2);
+}
+setInterval(updateFreshnessLabel, 30000);
+
 function loadData() {
   return fetch(DATA_URL)
     .then(r => r.json())
     .then(data => {
+      lastGeneratedAt = new Date(data.generated_at);
+      updateFreshnessLabel();
+      hideLoadingOverlay();
       const bounds = [];
       const seenIds = new Set();
       data.paths.forEach(p => {
@@ -367,6 +603,7 @@ function loadData() {
           // with (e.g. an open bottom sheet).
           entry.visible.setStyle({ color: colorFor(p.speed_kmh) });
           entry.hit.speedKmh = p.speed_kmh;
+          entry.hit.travelTimeS = p.travel_time_s;
         } else {
           // Two lines per road: a thin visible one (what you see) and a much
           // wider invisible one on top of it (what actually catches taps) —
@@ -380,9 +617,10 @@ function loadData() {
             weight: 22, opacity: 0, interactive: true
           }).addTo(map);
           hit.speedKmh = p.speed_kmh;
+          hit.travelTimeS = p.travel_time_s;
           hit.on('click', (e) => {
             L.DomEvent.stopPropagation(e); // don't let this bubble to the map's own click-to-close handler
-            openSheet(hit.speedKmh);
+            openSheet(hit.speedKmh, hit.travelTimeS);
           });
           entry = { visible, hit };
           layersById.set(p.id, entry);
@@ -402,19 +640,26 @@ function loadData() {
         }
       }
 
-      // Waze crowdsourced point reports: road closures, hazards, jams.
+      // Waze crowdsourced point reports, routed by Waze's own alert type:
+      // ROAD_CLOSED joins the "closures" filter, HAZARD/ACCIDENT (and any
+      // unrecognized type) join "hazards", and JAM-type reports join the
+      // jams filter alongside the jam line segments below — stored with
+      // their target layer since which filter an entry belongs to varies
+      // per-alert here.
+      const ALERT_FILTER = { ROAD_CLOSED: 'closures', JAM: 'jams' };
       const seenAlertIds = new Set();
       (data.alerts || []).forEach(a => {
         if (a.lat == null || a.lon == null) return;
         seenAlertIds.add(a.id);
         if (alertsById.has(a.id)) return; // reports are immutable snapshots, nothing to update in place
         const s = alertStyle(a.type);
-        const marker = reportMarker(a.lat, a.lon, s.color, s.symbol, () => openAlertSheet(a));
-        alertsById.set(a.id, marker);
+        const layer = filterLayers[ALERT_FILTER[a.type] || 'hazards'];
+        const marker = reportMarker(a.lat, a.lon, s.color, s.symbol, () => openAlertSheet(a), layer);
+        alertsById.set(a.id, { marker, layer });
       });
-      for (const [id, marker] of alertsById) {
+      for (const [id, entry] of alertsById) {
         if (!seenAlertIds.has(id)) {
-          eventsLayer.removeLayer(marker);
+          entry.layer.removeLayer(entry.marker);
           alertsById.delete(id);
         }
       }
@@ -432,7 +677,7 @@ function loadData() {
           line.setStyle({ color: jamColor(j.jam_level) });
           line.jamData = j;
         } else {
-          line = L.polyline(latlngs, { color: jamColor(j.jam_level), weight: 6, opacity: 0.8 }).addTo(eventsLayer);
+          line = L.polyline(latlngs, { color: jamColor(j.jam_level), weight: 6, opacity: 0.8 }).addTo(filterLayers.jams);
           line.jamData = j;
           line.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
@@ -443,7 +688,7 @@ function loadData() {
       });
       for (const [id, line] of jamsById) {
         if (!seenJamIds.has(id)) {
-          eventsLayer.removeLayer(line);
+          filterLayers.jams.removeLayer(line);
           jamsById.delete(id);
         }
       }
@@ -455,12 +700,12 @@ function loadData() {
         seenSituationIds.add(sit.id);
         if (situationsById.has(sit.id)) return; // same rationale as alerts above
         const s = situationStyle(sit.type);
-        const marker = reportMarker(sit.lat, sit.lon, s.color, s.symbol, () => openSituationSheet(sit));
+        const marker = reportMarker(sit.lat, sit.lon, s.color, s.symbol, () => openSituationSheet(sit), filterLayers.works);
         situationsById.set(sit.id, marker);
       });
       for (const [id, marker] of situationsById) {
         if (!seenSituationIds.has(id)) {
-          eventsLayer.removeLayer(marker);
+          filterLayers.works.removeLayer(marker);
           situationsById.delete(id);
         }
       }
@@ -473,6 +718,8 @@ function loadData() {
     })
     .catch(err => {
       console.error('Failed to load latest.json:', err);
+      showToast(initialLoadDone ? "Couldn't refresh — showing last known data" : "Couldn't load traffic data");
+      hideLoadingOverlay();
     });
 }
 
