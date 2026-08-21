@@ -200,13 +200,21 @@ async function fetchAndParse(url, parse, label) {
   }
 }
 
+// Temporarily disabled: fetching+regex-parsing all 5 feeds every 5 min
+// exceeds the 10ms CPU budget on the Workers Free plan (scheduled() started
+// failing with "exceededCpu" on every tick, freezing KV on stale data for
+// hours). Parsing logic for all three is left intact below — flip this back
+// on once either upgraded to Workers Paid (raises the CPU cap to 30s) or the
+// parsing itself is made cheaper.
+const FETCH_EVENTS = false;
+
 async function buildSnapshot() {
   const [geometryText, liveText, alerts, jams, situations] = await Promise.all([
     fetch(GEOMETRY_URL).then((r) => r.text()),
     fetch(LIVE_URL).then((r) => r.text()),
-    fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts"),
-    fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic"),
-    fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication"),
+    FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
+    FETCH_EVENTS ? fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic") : Promise.resolve([]),
+    FETCH_EVENTS ? fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication") : Promise.resolve([]),
   ]);
 
   const geometry = parseGeometry(geometryText);
@@ -290,6 +298,13 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/refresh") {
+      // Forces an extra fetch against the upstream feeds and burns CPU time
+      // (tight budget on the Workers Free plan — see FETCH_EVENTS above), so
+      // it's gated behind a shared secret set as a dashboard secret (never
+      // committed to wrangler.toml). Fails closed if the secret isn't set.
+      if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
+        return new Response("Unauthorized", { status: 401 });
+      }
       console.log(`GET /refresh from ${describeCaller(request)}`);
       const snapshot = await buildSnapshot();
       if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
