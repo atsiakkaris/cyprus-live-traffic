@@ -11,6 +11,7 @@ import re
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -100,10 +101,17 @@ def build_snapshot():
         entry.update(live.get(pid, {"speed_kmh": None, "travel_time_s": None, "measured_at": None}))
         paths.append(entry)
 
+    # Mode (not max) across all paths' own measured_at — see worker.js's
+    # modeMeasuredAt for the reasoning; kept in sync here so local dev via
+    # the poller shows the same "outdated since" note as the deployed app.
+    measured_ats = [p["measured_at"] for p in paths if p.get("measured_at")]
+    common_measurement_timestamp = Counter(measured_ats).most_common(1)[0][0] if measured_ats else None
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "path_count": len(paths),
         "matched_live_count": sum(1 for p in paths if p.get("speed_kmh") is not None),
+        "common_measurement_timestamp": common_measurement_timestamp,
         "paths": paths,
     }
 

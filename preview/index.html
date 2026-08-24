@@ -126,6 +126,13 @@
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
   }
   .freshness.stale { color: #c0392b; font-weight: 600; }
+  /* Discreet second line — only shown when the underlying feed data itself
+     is old, distinct from the line above which only proves our own poll
+     succeeded (a poll can succeed every few minutes while silently serving
+     the same frozen measurement over and over). Smaller/lighter than the
+     line above so it doesn't compete for attention when everything's fine —
+     which is most of the time, it's hidden entirely. */
+  .outdated-note { font-size: 10px; color: #c0392b; margin-top: 2px; }
 
   /* Lives inside the legend header instead of as a fourth separate floating
      chip — it only matters when you're already looking at legend colors. */
@@ -205,6 +212,7 @@
     .sheet-speed .unit { color: #aaa; }
     .freshness { color: #aaa; }
     .freshness.stale { color: #ff7675; }
+    .outdated-note { color: #ff7675; }
     .locate-btn:active { background: #3a3a42; }
     .locate-btn svg { stroke: #eee; }
     .loading-overlay { background: rgba(20,20,24,0.5); }
@@ -215,7 +223,10 @@
 <div id="map"></div>
 <div class="loading-overlay" id="loadingOverlay"><div class="spinner"></div></div>
 
-<div class="freshness" id="freshness"></div>
+<div class="freshness" id="freshness">
+  <div id="freshnessText"></div>
+  <div class="outdated-note" id="outdatedNote" hidden></div>
+</div>
 
 <div class="legend-wrap">
   <div class="legend collapsed" id="legend">
@@ -231,15 +242,15 @@
       <div><span id="legendModerate" style="background:#f1c40f"></span>Moderate 30–60</div>
       <div><span id="legendSlow" style="background:#e74c3c"></span>Slow &lt;30</div>
       <div><span style="background:#95a5a6"></span>No data</div>
-      <div class="divider"></div>
-      <div><span class="swatch-line" style="background:#9d4edd"></span>Crowdsourced jam</div>
-      <div><span class="swatch-symbol" style="background:#c0392b">🚫</span>Road closed</div>
-      <div><span class="swatch-symbol" style="background:#f39c12">⚠️</span>Hazard</div>
-      <div><span class="swatch-symbol" style="background:#d90429">💥</span>Accident</div>
-      <div><span class="swatch-symbol" style="background:#e67e22">🚧</span>Road works</div>
+      <div class="divider event-legend"></div>
+      <div class="event-legend"><span class="swatch-line" style="background:#9d4edd"></span>Crowdsourced jam</div>
+      <div class="event-legend"><span class="swatch-symbol" style="background:#c0392b">🚫</span>Road closed</div>
+      <div class="event-legend"><span class="swatch-symbol" style="background:#f39c12">⚠️</span>Hazard</div>
+      <div class="event-legend"><span class="swatch-symbol" style="background:#d90429">💥</span>Accident</div>
+      <div class="event-legend"><span class="swatch-symbol" style="background:#e67e22">🚧</span>Road works</div>
     </div>
   </div>
-  <div class="filter-row">
+  <div class="filter-row event-legend">
     <button class="filter-toggle" id="filterClosures" data-filter="closures" aria-label="Toggle road closures">🚫</button>
     <button class="filter-toggle" id="filterHazards" data-filter="hazards" aria-label="Toggle hazards and accidents">⚠️</button>
     <button class="filter-toggle" id="filterJams" data-filter="jams" aria-label="Toggle crowdsourced jams">🚗</button>
@@ -265,6 +276,16 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>
+// Mirrors FETCH_EVENTS in worker/worker.js — the Worker currently returns
+// empty alerts/jams/situations arrays (disabled there to fix a CPU-limit
+// cron failure), so hide the now-pointless legend rows and filter chips
+// rather than show controls for data that never arrives. Flip both flags
+// back to true together once the feeds are re-enabled worker-side.
+const EVENTS_ENABLED = false;
+if (!EVENTS_ENABLED) {
+  document.querySelectorAll('.event-legend').forEach(el => el.style.display = 'none');
+}
+
 // Canvas instead of the SVG default: with 429 roads x 2 lines each plus jam
 // segments, canvas rendering keeps pan/zoom noticeably smoother on phones.
 const map = L.map('map', { zoomControl: false, tap: true, renderer: L.canvas() }).setView([35.05, 33.15], 9);
@@ -573,15 +594,40 @@ let initialLoadDone = false;
 // should have landed, so still showing the old timestamp means something's
 // actually wrong upstream (as opposed to just "a couple minutes old").
 const freshnessEl = document.getElementById('freshness');
+const freshnessTextEl = document.getElementById('freshnessText');
+const outdatedNoteEl = document.getElementById('outdatedNote');
 let lastGeneratedAt = null;
 function updateFreshnessLabel() {
   if (!lastGeneratedAt) return;
   const mins = Math.floor((Date.now() - lastGeneratedAt.getTime()) / 60000);
   const text = mins < 1 ? 'Updated just now' : `Updated ${mins} min ago`;
-  freshnessEl.textContent = text;
+  freshnessTextEl.textContent = text;
   freshnessEl.classList.toggle('stale', mins * 60000 > REFRESH_INTERVAL_MS * 2);
 }
 setInterval(updateFreshnessLabel, 30000);
+
+// Separate from updateFreshnessLabel above: that one only proves the app's
+// own poll succeeded, this one checks whether the underlying feed data is
+// actually current. commonMeasurementTimestamp only advances if the feed
+// genuinely produces new measurements — a frozen upstream feed can keep
+// returning 200 OK with the same stale timestamp indefinitely.
+// 1h threshold matches the same convention used server-side in the
+// traffic-control-room project's own staleness checks.
+const OUTDATED_THRESHOLD_MS = 60 * 60 * 1000;
+let commonMeasurementTimestamp = null;
+function updateOutdatedNote() {
+  if (!commonMeasurementTimestamp) { outdatedNoteEl.hidden = true; return; }
+  const since = new Date(commonMeasurementTimestamp);
+  const ageMs = Date.now() - since.getTime();
+  if (ageMs <= OUTDATED_THRESHOLD_MS) { outdatedNoteEl.hidden = true; return; }
+  const totalHours = Math.floor(ageMs / 3600000);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  const duration = days >= 1 ? (days < 3 ? `${days}d ${hours}h` : `${days}d`) : `${totalHours}h`;
+  outdatedNoteEl.textContent = `Data outdated since ${since.toLocaleString()} (${duration})`;
+  outdatedNoteEl.hidden = false;
+}
+setInterval(updateOutdatedNote, 30000);
 
 function loadData() {
   return fetch(DATA_URL)
@@ -589,6 +635,8 @@ function loadData() {
     .then(data => {
       lastGeneratedAt = new Date(data.generated_at);
       updateFreshnessLabel();
+      commonMeasurementTimestamp = data.common_measurement_timestamp || null;
+      updateOutdatedNote();
       hideLoadingOverlay();
       const bounds = [];
       const seenIds = new Set();

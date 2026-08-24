@@ -230,11 +230,32 @@ async function buildSnapshot() {
     generated_at: new Date().toISOString(),
     path_count: paths.length,
     matched_live_count: paths.filter((p) => p.speed_kmh != null).length,
+    // Mode (not max) across all paths' own measured_at — the timestamp most
+    // paths share represents the feed's bulk state, resistant to a handful
+    // of outlier paths in either direction (one stray fresh path masking a
+    // broad freeze, or one permanently-broken path never letting the app
+    // report "current"). generated_at above only proves the Worker's own
+    // poll succeeded, not that the underlying data actually moved — this is
+    // the field that catches a frozen-but-still-200-OK upstream feed.
+    common_measurement_timestamp: modeMeasuredAt(paths),
     paths,
     alerts,
     jams,
     situations,
   };
+}
+
+function modeMeasuredAt(paths) {
+  const counts = new Map();
+  for (const p of paths) {
+    if (!p.measured_at) continue;
+    counts.set(p.measured_at, (counts.get(p.measured_at) || 0) + 1);
+  }
+  let best = null, bestCount = 0;
+  for (const [ts, count] of counts) {
+    if (count > bestCount) { best = ts; bestCount = count; }
+  }
+  return best;
 }
 
 const JSON_HEADERS = {
