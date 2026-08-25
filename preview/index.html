@@ -604,6 +604,16 @@ function openSituationSheet(sit) {
   `;
   showSheet();
 }
+
+function openClosureSheet(rc) {
+  sheetBody.innerHTML = `
+    <div class="sheet-title">🚫 Road closed</div>
+    ${rc.street ? `<div class="sheet-sub">${escapeHtml(rc.street)}</div>` : ''}
+    <div class="sheet-meta">${rc.points.length} points along the closed section${rc.report_time ? ' — reported ' + escapeHtml(rc.report_time) : ''}</div>
+    <div class="sheet-source">Source: Waze Alerts</div>
+  `;
+  showSheet();
+}
 sheetClose.addEventListener('click', closeSheet);
 // The backdrop no longer blocks touches (map must stay pannable/zoomable
 // while the sheet is open), so tapping empty map space is what now closes
@@ -691,6 +701,7 @@ function hideLoadingOverlay() {
 
 const layersById = new Map();
 const alertsById = new Map();
+const roadClosuresById = new Map();
 const jamsById = new Map();
 const situationsById = new Map();
 let initialLoadDone = false;
@@ -814,6 +825,37 @@ function loadData() {
         if (!seenAlertIds.has(id)) {
           entry.layer.removeLayer(entry.marker);
           alertsById.delete(id);
+        }
+      }
+
+      // Multi-point road closures (see worker.js groupRoadClosures) — Waze's
+      // own map draws these as barrier icons connected by a line rather than
+      // isolated dots, since a closure often spans several waypoints along
+      // one road. The line already conveys the full shape, so only the start
+      // and end get their own marker — a marker per intermediate waypoint
+      // (some closures have 5-6) was just clutter on a small phone screen.
+      const closureStyle = alertStyle('ROAD_CLOSED');
+      const seenClosureIds = new Set();
+      (data.road_closures || []).forEach(rc => {
+        if (!rc.points || rc.points.length < 2) return;
+        seenClosureIds.add(rc.id);
+        if (roadClosuresById.has(rc.id)) return; // immutable snapshot, same rationale as alerts above
+        const latlngs = rc.points.map(p => [p.lat, p.lon]);
+        const line = L.polyline(latlngs, {
+          color: closureStyle.color, weight: 5, opacity: 0.85, dashArray: '2,8'
+        }).addTo(filterLayers.closures);
+        line.on('click', (e) => { L.DomEvent.stopPropagation(e); openClosureSheet(rc); });
+        const endpoints = [rc.points[0], rc.points[rc.points.length - 1]];
+        const markers = endpoints.map(p =>
+          reportMarker(p.lat, p.lon, closureStyle.color, closureStyle.symbol, () => openClosureSheet(rc), filterLayers.closures)
+        );
+        roadClosuresById.set(rc.id, { line, markers });
+      });
+      for (const [id, entry] of roadClosuresById) {
+        if (!seenClosureIds.has(id)) {
+          filterLayers.closures.removeLayer(entry.line);
+          entry.markers.forEach(m => filterLayers.closures.removeLayer(m));
+          roadClosuresById.delete(id);
         }
       }
 

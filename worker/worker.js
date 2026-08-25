@@ -132,6 +132,98 @@ function parseWazeAlerts(text) {
   return alerts;
 }
 
+function haversineKm(a, b) {
+  const R = 6371;
+  const dLat = ((b[0] - a[0]) * Math.PI) / 180;
+  const dLon = ((b[1] - a[1]) * Math.PI) / 180;
+  const lat1 = (a[0] * Math.PI) / 180;
+  const lat2 = (b[0] * Math.PI) / 180;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// Waze's own map draws closed road segments as a connected line through
+// several barrier icons rather than isolated points — but the feed itself
+// (see parseWazeAlerts) only ever gives ROAD_CLOSED alerts as single points,
+// with no segment/line geometry anywhere. Reverse-engineered grouping key
+// from the raw feed: records sharing the same street AND the exact same
+// report_time are waypoints of one closure submission split into multiple
+// points. When street is missing, fall back to report_time alone, but only
+// chain points within MAX_CLOSURE_GAP_KM of their neighbor — guards against
+// two unrelated closures coincidentally reported in the same second.
+const MAX_CLOSURE_GAP_KM = 3;
+
+// Points within a group come back from the feed in arbitrary order, not
+// necessarily walking along the road — connecting them as-is can zigzag
+// back and forth across the same street instead of running straight along
+// it. Nearest-neighbor chaining (greedy: repeatedly jump to whichever
+// remaining point is closest) reorders them into a sane path first.
+function orderPointsAlongPath(points) {
+  if (points.length <= 2) return points;
+  const remaining = points.slice();
+  const ordered = [remaining.shift()];
+  while (remaining.length) {
+    const last = ordered[ordered.length - 1];
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const d = haversineKm([last.lat, last.lon], [remaining[i].lat, remaining[i].lon]);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    ordered.push(remaining.splice(bestIdx, 1)[0]);
+  }
+  return ordered;
+}
+
+function groupRoadClosures(alerts) {
+  const closed = alerts.filter((a) => a.type === "ROAD_CLOSED");
+  const rest = alerts.filter((a) => a.type !== "ROAD_CLOSED");
+
+  const byKey = new Map();
+  for (const a of closed) {
+    const key = a.street ? `s:${a.street}|${a.report_time}` : `t:${a.report_time}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(a);
+  }
+
+  const road_closures = [];
+  const singles = [];
+  const asClosure = (points) => ({
+    id: points[0].id,
+    street: points[0].street,
+    report_time: points[0].report_time,
+    points: points.map((p) => ({ id: p.id, lat: p.lat, lon: p.lon })),
+  });
+
+  for (const group of byKey.values()) {
+    if (group.length === 1) {
+      singles.push(group[0]);
+    } else if (group[0].street) {
+      road_closures.push(asClosure(orderPointsAlongPath(group)));
+    } else {
+      const ordered = orderPointsAlongPath(group);
+      let chain = [ordered[0]];
+      for (let i = 1; i < ordered.length; i++) {
+        const prev = chain[chain.length - 1];
+        if (haversineKm([prev.lat, prev.lon], [ordered[i].lat, ordered[i].lon]) <= MAX_CLOSURE_GAP_KM) {
+          chain.push(ordered[i]);
+        } else {
+          if (chain.length > 1) road_closures.push(asClosure(chain));
+          else singles.push(chain[0]);
+          chain = [ordered[i]];
+        }
+      }
+      if (chain.length > 1) road_closures.push(asClosure(chain));
+      else singles.push(chain[0]);
+    }
+  }
+
+  return { alerts: [...rest, ...singles], road_closures };
+}
+
 // Waze crowdsourced jam segments: a from/to road description, a 0–5 jamLevel,
 // and a line (start/intermediate/end points) rather than a single point.
 function parseWazeTraffic(text) {
@@ -228,7 +320,7 @@ async function loadGeometry(env) {
 }
 
 async function buildSnapshot(env, { refreshGeometry = false } = {}) {
-  const [geometry, liveText, alerts, jams, situations] = await Promise.all([
+  const [geometry, liveText, alertsRaw, jams, situations] = await Promise.all([
     refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
     fetch(LIVE_URL).then((r) => r.text()),
     FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
@@ -237,6 +329,7 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
   ]);
 
   const live = parseLive(liveText);
+  const { alerts, road_closures } = groupRoadClosures(alertsRaw);
 
   const paths = [];
   for (const [pid, geo] of geometry) {
@@ -258,6 +351,7 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     common_measurement_timestamp: modeMeasuredAt(paths),
     paths,
     alerts,
+    road_closures,
     jams,
     situations,
   };
