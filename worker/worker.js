@@ -200,24 +200,42 @@ async function fetchAndParse(url, parse, label) {
   }
 }
 
-// Temporarily disabled: fetching+regex-parsing all 5 feeds every 5 min
-// exceeds the 10ms CPU budget on the Workers Free plan (scheduled() started
-// failing with "exceededCpu" on every tick, freezing KV on stale data for
-// hours). Parsing logic for all three is left intact below — flip this back
-// on once either upgraded to Workers Paid (raises the CPU cap to 30s) or the
-// parsing itself is made cheaper.
-const FETCH_EVENTS = false;
+// Re-enabled now that geometry is cached (see loadGeometry below) instead of
+// re-parsed every tick — that was the heaviest chunk of the CPU budget that
+// caused the exceededCpu failures. If those come back, this is the first
+// thing to flip off again.
+const FETCH_EVENTS = true;
 
-async function buildSnapshot() {
-  const [geometryText, liveText, alerts, jams, situations] = await Promise.all([
-    fetch(GEOMETRY_URL).then((r) => r.text()),
+// Road geometry (shape of each path) essentially never changes tick to tick
+// — re-fetching and re-parsing it every 5 min was the single heaviest chunk
+// of the CPU budget that caused the exceededCpu failures above, for data
+// that's static almost all the time. Cached in KV and only refreshed on its
+// own slower cron (see GEOMETRY_CRON below) instead, so the regular 5-min
+// tick only has to parse the small live-speed feed.
+async function fetchAndCacheGeometry(env) {
+  const geometryText = await fetch(GEOMETRY_URL).then((r) => r.text());
+  const geometry = parseGeometry(geometryText);
+  await env.TRAFFIC_KV.put("geometry", JSON.stringify([...geometry]));
+  return geometry;
+}
+
+async function loadGeometry(env) {
+  const cached = await env.TRAFFIC_KV.get("geometry");
+  if (cached) return new Map(JSON.parse(cached));
+  // No cache yet (first-ever run before the geometry cron has fired once) —
+  // fetch it live this one time so the app isn't left with zero paths.
+  return fetchAndCacheGeometry(env);
+}
+
+async function buildSnapshot(env, { refreshGeometry = false } = {}) {
+  const [geometry, liveText, alerts, jams, situations] = await Promise.all([
+    refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
     fetch(LIVE_URL).then((r) => r.text()),
     FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication") : Promise.resolve([]),
   ]);
 
-  const geometry = parseGeometry(geometryText);
   const live = parseLive(liveText);
 
   const paths = [];
@@ -305,9 +323,14 @@ function describeCaller(request) {
 // good snapshot" instead of wiping the live app blank for every user.
 const MIN_HEALTHY_PATH_COUNT = 50;
 
+// Must match the second entry in wrangler.toml's [triggers] crons — the
+// slower schedule that re-fetches/re-parses geometry (see loadGeometry
+// above). Every other cron firing (the 5-min tick) uses the cached copy.
+const GEOMETRY_CRON = "0 */6 * * *";
+
 export default {
   async scheduled(event, env, ctx) {
-    const snapshot = await buildSnapshot();
+    const snapshot = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
     if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
       console.error(`Refusing to store suspicious snapshot: only ${snapshot.path_count} paths (upstream likely broken)`);
       return;
@@ -327,7 +350,7 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
       console.log(`GET /refresh from ${describeCaller(request)}`);
-      const snapshot = await buildSnapshot();
+      const snapshot = await buildSnapshot(env, { refreshGeometry: true });
       if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
         console.error(`Refusing to store suspicious snapshot: only ${snapshot.path_count} paths (upstream likely broken)`);
         return new Response(

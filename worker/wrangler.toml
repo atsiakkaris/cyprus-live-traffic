@@ -7,7 +7,10 @@ main = "worker.js"
 compatibility_date = "2026-08-01"
 
 [triggers]
-crons = ["*/5 * * * *"]
+# "*/5 * * * *": regular tick — live speeds + events, cached geometry.
+# "0 */6 * * *": 4x/day — also re-fetches/re-parses geometry (see
+# GEOMETRY_CRON in worker.js, must match this second entry exactly).
+crons = ["*/5 * * * *", "0 */6 * * *"]
 
 # Without this, a git-connected `wrangler deploy` resets Observability Logs to
 # disabled on every deploy (dashboard-only toggle, not wrangler's default) —

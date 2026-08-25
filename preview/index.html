@@ -145,16 +145,24 @@
   }
   .backdrop.open { opacity: 1; }
 
-  .locate-btn {
+  /* Groups zoom +/- above the locate button as one bottom-right stack,
+     matching the legend-wrap pattern used top-right — a single positioned
+     column instead of each button carrying its own absolute offset. */
+  .map-controls {
     position: absolute; z-index: 1000;
     right: calc(env(safe-area-inset-right, 0px) + 12px);
     bottom: calc(env(safe-area-inset-bottom, 0px) + 28px);
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  .zoom-btn, .locate-btn {
     width: 46px; height: 46px; border-radius: 50%;
     background: var(--panel-bg); border: none;
     box-shadow: 0 2px 10px rgba(0,0,0,.25);
     display: flex; align-items: center; justify-content: center;
   }
-  .locate-btn:active { background: var(--locate-active-bg); }
+  .zoom-btn:active, .locate-btn:active { background: var(--locate-active-bg); }
+  .zoom-btn { font-size: 22px; line-height: 1; color: var(--locate-stroke); }
+  .zoom-btn.disabled { opacity: 0.35; pointer-events: none; }
   .locate-btn svg { width: 24px; height: 24px; stroke: var(--locate-stroke); }
   .locate-btn.locating svg { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -180,6 +188,11 @@
     background: var(--panel-bg); padding: 6px 12px; border-radius: 20px;
     font-size: 12px; color: var(--freshness-color);
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
+    /* Without this, the "Data outdated since ..." line has no width limit
+       and grows to fit its full text on one line — on narrower phones that
+       reaches far enough right to overlap the legend panel. Capped and left
+       to wrap instead, same guard the legend box already has. */
+    max-width: 42vw;
   }
   .freshness.stale { color: var(--stale-color); font-weight: 600; }
   /* Discreet second line — only shown when the underlying feed data itself
@@ -232,6 +245,7 @@
   .sheet-title { font-size: 18px; font-weight: 700; }
   .sheet-sub { font-size: 15px; color: var(--sheet-sub-color); margin-top: 4px; }
   .sheet-meta { font-size: 13px; color: var(--sheet-unit-color); margin-top: 8px; }
+  .sheet-source { font-size: 11px; color: var(--sheet-unit-color); margin-top: 10px; opacity: 0.7; }
 
   .loading-overlay {
     position: absolute; inset: 0; z-index: 1800;
@@ -305,12 +319,16 @@
   <div id="sheetBody"></div>
 </div>
 
-<button class="locate-btn" id="locateBtn" aria-label="Find my location">
-  <svg viewBox="0 0 24 24" fill="none" stroke="#1a1a2e" stroke-width="2">
-    <circle cx="12" cy="12" r="3"></circle>
-    <path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path>
-  </svg>
-</button>
+<div class="map-controls">
+  <button class="zoom-btn" id="zoomInBtn" aria-label="Zoom in">+</button>
+  <button class="zoom-btn" id="zoomOutBtn" aria-label="Zoom out">&minus;</button>
+  <button class="locate-btn" id="locateBtn" aria-label="Find my location">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#1a1a2e" stroke-width="2">
+      <circle cx="12" cy="12" r="3"></circle>
+      <path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path>
+    </svg>
+  </button>
+</div>
 <div class="toast" id="toast"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -321,7 +339,7 @@
 // cron failure), so hide the now-pointless legend rows and filter chips
 // rather than show controls for data that never arrives. Flip both flags
 // back to true together once the feeds are re-enabled worker-side.
-const EVENTS_ENABLED = false;
+const EVENTS_ENABLED = true;
 if (!EVENTS_ENABLED) {
   document.querySelectorAll('.event-legend').forEach(el => el.style.display = 'none');
 }
@@ -385,11 +403,15 @@ document.getElementById('legendHeader').addEventListener('click', () => {
 // since it mixes JAM-type markers with polyline segments — markerClusterGroup
 // only clusters L.Marker instances — and jam counts are typically low
 // enough that clustering wouldn't help anyway.
+// maxClusterRadius lowered (was 50) — markers were merging into clusters
+// too readily; a tighter radius keeps individual events visible sooner
+// instead of only after zooming all the way in.
+const CLUSTER_OPTS = { maxClusterRadius: 35 };
 const filterLayers = {
-  closures: L.markerClusterGroup({ maxClusterRadius: 50 }),
-  hazards: L.markerClusterGroup({ maxClusterRadius: 50 }),
+  closures: L.markerClusterGroup(CLUSTER_OPTS),
+  hazards: L.markerClusterGroup(CLUSTER_OPTS),
   jams: L.layerGroup(),
-  works: L.markerClusterGroup({ maxClusterRadius: 50 }),
+  works: L.markerClusterGroup(CLUSTER_OPTS),
 };
 const filterVisible = { closures: false, hazards: false, jams: false, works: false };
 document.querySelectorAll('.filter-toggle').forEach((btn) => {
@@ -554,6 +576,7 @@ function openAlertSheet(a) {
     <div class="sheet-title">${s.symbol} ${s.label}${sub ? ' — ' + sub : ''}</div>
     ${a.street ? `<div class="sheet-sub">${escapeHtml(a.street)}</div>` : ''}
     ${a.report_time ? `<div class="sheet-meta">Reported ${escapeHtml(a.report_time)}</div>` : ''}
+    <div class="sheet-source">Source: Waze Alerts</div>
   `;
   showSheet();
 }
@@ -563,6 +586,7 @@ function openJamSheet(j) {
     <div class="sheet-title">🚗 Crowdsourced jam</div>
     ${j.from || j.to ? `<div class="sheet-sub">${escapeHtml(j.from || '')}${j.from && j.to ? ' → ' : ''}${escapeHtml(j.to || '')}</div>` : ''}
     <div class="sheet-meta">Jam level ${j.jam_level}/5</div>
+    <div class="sheet-source">Source: Waze Traffic</div>
   `;
   showSheet();
 }
@@ -576,6 +600,7 @@ function openSituationSheet(sit) {
     <div class="sheet-title">${s.symbol} ${s.label}</div>
     ${sit.description ? `<div class="sheet-sub">${escapeHtml(sit.description)}</div>` : ''}
     ${period ? `<div class="sheet-meta">${period}</div>` : ''}
+    <div class="sheet-source">Source: traffic4cyprus (official)</div>
   `;
   showSheet();
 }
@@ -594,6 +619,20 @@ function showToast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2500);
 }
+
+// Custom-styled zoom buttons instead of Leaflet's default control (hidden
+// above via .leaflet-control-zoom) to match the app's own white-pill design
+// language rather than mixing in Leaflet's default skin.
+const zoomInBtn = document.getElementById('zoomInBtn');
+const zoomOutBtn = document.getElementById('zoomOutBtn');
+zoomInBtn.addEventListener('click', (e) => { e.stopPropagation(); map.zoomIn(); });
+zoomOutBtn.addEventListener('click', (e) => { e.stopPropagation(); map.zoomOut(); });
+function updateZoomButtons() {
+  zoomInBtn.classList.toggle('disabled', map.getZoom() >= map.getMaxZoom());
+  zoomOutBtn.classList.toggle('disabled', map.getZoom() <= map.getMinZoom());
+}
+map.on('zoomend', updateZoomButtons);
+updateZoomButtons();
 
 let userMarker = null;
 const locateBtn = document.getElementById('locateBtn');
