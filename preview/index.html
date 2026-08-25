@@ -13,6 +13,58 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 <style>
+  /* Theme tokens: light values here are the defaults; the system-preference
+     media query and the manual light/dark toggle (data-theme attribute on
+     <html>) both just override these same variables, so every consuming
+     rule below only has to be written once. */
+  :root {
+    --panel-bg: rgba(255,255,255,0.95);
+    --panel-color: #1a1a2e;
+    --sheet-bg: #fff;
+    --divider-color: #ddd;
+    --sheet-handle-bg: #ddd;
+    --sheet-sub-color: #444;
+    --sheet-close-color: #999;
+    --sheet-unit-color: #888;
+    --freshness-color: #888;
+    --stale-color: #c0392b;
+    --locate-active-bg: #eee;
+    --locate-stroke: #1a1a2e;
+    --loading-bg: rgba(255,255,255,0.5);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --panel-bg: rgba(30,30,36,0.95);
+      --panel-color: #eee;
+      --sheet-bg: rgba(30,30,36,0.95);
+      --divider-color: #444;
+      --sheet-handle-bg: #555;
+      --sheet-sub-color: #ccc;
+      --sheet-close-color: #aaa;
+      --sheet-unit-color: #aaa;
+      --freshness-color: #aaa;
+      --stale-color: #ff7675;
+      --locate-active-bg: #3a3a42;
+      --locate-stroke: #eee;
+      --loading-bg: rgba(20,20,24,0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    --panel-bg: rgba(30,30,36,0.95);
+    --panel-color: #eee;
+    --sheet-bg: rgba(30,30,36,0.95);
+    --divider-color: #444;
+    --sheet-handle-bg: #555;
+    --sheet-sub-color: #ccc;
+    --sheet-close-color: #aaa;
+    --sheet-unit-color: #aaa;
+    --freshness-color: #aaa;
+    --stale-color: #ff7675;
+    --locate-active-bg: #3a3a42;
+    --locate-stroke: #eee;
+    --loading-bg: rgba(20,20,24,0.5);
+  }
+
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body, #map { height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -29,13 +81,17 @@
   }
 
   .legend {
-    background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 12px;
+    background: var(--panel-bg); color: var(--panel-color);
+    padding: 10px 14px; border-radius: 12px;
     font-size: 13px; line-height: 1.9;
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
     max-width: 220px;
   }
   .legend div { display: flex; align-items: center; }
-  .legend span { display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; }
+  /* Scoped to .legend-body, not the whole .legend — it must not also catch
+     the header's <span> elements (legend-header-actions, chevron), which
+     need their own (flex) layout rather than a forced 10x10 dot. */
+  .legend-body span { display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; }
 
   .legend-header {
     display: flex; align-items: center; justify-content: space-between;
@@ -58,7 +114,7 @@
   /* Bottom sheet */
   .sheet {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 2000;
-    background: white; border-radius: 20px 20px 0 0;
+    background: var(--sheet-bg); color: var(--panel-color); border-radius: 20px 20px 0 0;
     box-shadow: 0 -4px 20px rgba(0,0,0,.2);
     padding: 10px 20px calc(env(safe-area-inset-bottom, 0px) + 24px);
     transform: translateY(110%);
@@ -66,18 +122,18 @@
   }
   .sheet.open { transform: translateY(0); }
   .sheet-handle {
-    width: 36px; height: 4px; background: #ddd; border-radius: 2px;
+    width: 36px; height: 4px; background: var(--sheet-handle-bg); border-radius: 2px;
     margin: 0 auto 14px;
   }
   .sheet-close {
     position: absolute; top: 10px; right: 14px;
     width: 30px; height: 30px; border: none; background: none;
     display: flex; align-items: center; justify-content: center;
-    color: #999; font-size: 20px; line-height: 1;
+    color: var(--sheet-close-color); font-size: 20px; line-height: 1;
   }
   .sheet-speed { font-size: 32px; font-weight: 700; }
-  .sheet-speed .unit { font-size: 16px; font-weight: 500; color: #888; margin-left: 4px; }
-  .sheet-nodata { font-size: 17px; color: #888; padding: 8px 0; }
+  .sheet-speed .unit { font-size: 16px; font-weight: 500; color: var(--sheet-unit-color); margin-left: 4px; }
+  .sheet-nodata { font-size: 17px; color: var(--sheet-unit-color); padding: 8px 0; }
 
   /* Purely visual dimming — never intercepts touches, so the map stays
      pannable/zoomable while the sheet is open. */
@@ -94,12 +150,12 @@
     right: calc(env(safe-area-inset-right, 0px) + 12px);
     bottom: calc(env(safe-area-inset-bottom, 0px) + 28px);
     width: 46px; height: 46px; border-radius: 50%;
-    background: white; border: none;
+    background: var(--panel-bg); border: none;
     box-shadow: 0 2px 10px rgba(0,0,0,.25);
     display: flex; align-items: center; justify-content: center;
   }
-  .locate-btn:active { background: #eee; }
-  .locate-btn svg { width: 24px; height: 24px; }
+  .locate-btn:active { background: var(--locate-active-bg); }
+  .locate-btn svg { width: 24px; height: 24px; stroke: var(--locate-stroke); }
   .locate-btn.locating svg { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -109,7 +165,7 @@
      noise stays off. */
   .filter-row { display: flex; gap: 8px; }
   .filter-toggle {
-    background: rgba(255,255,255,0.95); border: none; border-radius: 22px;
+    background: var(--panel-bg); border: none; border-radius: 22px;
     width: 44px; height: 44px; font-size: 17px;
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
     display: flex; align-items: center; justify-content: center;
@@ -121,27 +177,27 @@
     position: absolute; z-index: 1000;
     top: calc(env(safe-area-inset-top, 0px) + 12px);
     left: calc(env(safe-area-inset-left, 0px) + 12px);
-    background: rgba(255,255,255,0.95); padding: 6px 12px; border-radius: 20px;
-    font-size: 12px; color: #888;
+    background: var(--panel-bg); padding: 6px 12px; border-radius: 20px;
+    font-size: 12px; color: var(--freshness-color);
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
   }
-  .freshness.stale { color: #c0392b; font-weight: 600; }
+  .freshness.stale { color: var(--stale-color); font-weight: 600; }
   /* Discreet second line — only shown when the underlying feed data itself
      is old, distinct from the line above which only proves our own poll
      succeeded (a poll can succeed every few minutes while silently serving
      the same frozen measurement over and over). Smaller/lighter than the
      line above so it doesn't compete for attention when everything's fine —
      which is most of the time, it's hidden entirely. */
-  .outdated-note { font-size: 10px; color: #c0392b; margin-top: 2px; }
+  .outdated-note { font-size: 10px; color: var(--stale-color); margin-top: 2px; }
 
   /* Lives inside the legend header instead of as a fourth separate floating
      chip — it only matters when you're already looking at legend colors. */
   .legend-header-actions { display: flex; align-items: center; gap: 8px; }
-  .cvd-toggle {
+  .cvd-toggle, .theme-toggle {
     background: none; border: none; padding: 4px; font-size: 14px;
     opacity: 0.4; line-height: 1;
   }
-  .cvd-toggle.active { opacity: 1; }
+  .cvd-toggle.active, .theme-toggle { opacity: 1; }
 
   .toast {
     position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 90px);
@@ -163,7 +219,7 @@
     font-size: 17px; line-height: 1;
   }
 
-  .legend .divider { height: 1px; background: #ddd; margin: 6px 0; }
+  .legend .divider { height: 1px; background: var(--divider-color); margin: 6px 0; }
   .legend .swatch-line { width: 14px; height: 4px; border-radius: 2px; margin-right: 8px; }
   /* Legend dots for point-report rows mirror the actual on-map marker: a
      colored circle with the same symbol inside, not a plain color swatch. */
@@ -174,13 +230,13 @@
   }
 
   .sheet-title { font-size: 18px; font-weight: 700; }
-  .sheet-sub { font-size: 15px; color: #444; margin-top: 4px; }
-  .sheet-meta { font-size: 13px; color: #888; margin-top: 8px; }
+  .sheet-sub { font-size: 15px; color: var(--sheet-sub-color); margin-top: 4px; }
+  .sheet-meta { font-size: 13px; color: var(--sheet-unit-color); margin-top: 8px; }
 
   .loading-overlay {
     position: absolute; inset: 0; z-index: 1800;
     display: flex; align-items: center; justify-content: center;
-    background: rgba(255,255,255,0.5);
+    background: var(--loading-bg);
     opacity: 1; transition: opacity 250ms ease;
     pointer-events: none;
   }
@@ -200,23 +256,6 @@
   }
   .marker-cluster span { color: white; }
 
-  @media (prefers-color-scheme: dark) {
-    .legend, .freshness, .filter-toggle, .sheet, .locate-btn {
-      background: rgba(30,30,36,0.95); color: #eee;
-    }
-    .legend-header { color: #eee; }
-    .legend .divider { background: #444; }
-    .sheet-handle { background: #555; }
-    .sheet-sub { color: #ccc; }
-    .sheet-close { color: #aaa; }
-    .sheet-speed .unit { color: #aaa; }
-    .freshness { color: #aaa; }
-    .freshness.stale { color: #ff7675; }
-    .outdated-note { color: #ff7675; }
-    .locate-btn:active { background: #3a3a42; }
-    .locate-btn svg { stroke: #eee; }
-    .loading-overlay { background: rgba(20,20,24,0.5); }
-  }
 </style>
 </head>
 <body>
@@ -233,6 +272,7 @@
     <div class="legend-header" id="legendHeader">
       <span>Legend</span>
       <span class="legend-header-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="Toggle light/dark theme">🌙</button>
         <button class="cvd-toggle" id="cvdToggle" aria-label="Toggle colorblind-friendly colors">🎨</button>
         <span class="chevron">▾</span>
       </span>
@@ -289,15 +329,41 @@ if (!EVENTS_ENABLED) {
 // Canvas instead of the SVG default: with 429 roads x 2 lines each plus jam
 // segments, canvas rendering keeps pan/zoom noticeably smoother on phones.
 const map = L.map('map', { zoomControl: false, tap: true, renderer: L.canvas() }).setView([35.05, 33.15], 9);
-// CARTO's dark basemap in place of Voyager when the OS is in dark mode —
-// checked once at load rather than watched live, since switching tile sets
-// under a user mid-session would be jarring.
-const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-L.tileLayer(`https://{s}.basemaps.cartocdn.com/${prefersDark ? 'dark_all' : 'rastertiles/voyager'}/{z}/{x}/{y}{r}.png`, {
-  attribution: '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-  subdomains: 'abcd',
-  maxZoom: 20
-}).addTo(map);
+
+// Theme: system preference by default, overridable via the toggle button
+// (persisted in localStorage). The override is applied as a data-theme
+// attribute on <html>, which both the CSS variables above and the basemap
+// tile layer below key off of — so flipping it updates everything at once,
+// unlike the old load-once-only approach.
+function currentTheme() {
+  const stored = localStorage.getItem('theme');
+  if (stored === 'light' || stored === 'dark') return stored;
+  return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+}
+
+let basemapLayer = null;
+function applyBasemap(theme) {
+  if (basemapLayer) map.removeLayer(basemapLayer);
+  basemapLayer = L.tileLayer(`https://{s}.basemaps.cartocdn.com/${theme === 'dark' ? 'dark_all' : 'rastertiles/voyager'}/{z}/{x}/{y}{r}.png`, {
+    attribution: '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 20
+  }).addTo(map);
+}
+
+const themeToggleBtn = document.getElementById('themeToggle');
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  themeToggleBtn.textContent = theme === 'dark' ? '🌙' : '☀️';
+  applyBasemap(theme);
+}
+applyTheme(currentTheme());
+themeToggleBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  applyTheme(next);
+});
 
 // Starts collapsed so it doesn't eat phone screen space by default — tap
 // the header to expand. Doesn't stop event propagation to the map's own
