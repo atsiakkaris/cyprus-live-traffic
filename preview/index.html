@@ -180,6 +180,16 @@
   .locate-btn svg { width: 24px; height: 24px; stroke: var(--locate-stroke); }
   .locate-btn.locating svg { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* Persists until geolocation actually succeeds, instead of only a toast
+     that vanishes after a few seconds — so looking at the button later
+     still tells you why it isn't auto-centering. */
+  .locate-btn.denied { position: relative; }
+  .locate-btn.denied svg { opacity: 0.4; }
+  .locate-btn.denied::after {
+    content: ''; position: absolute; top: 6px; right: 6px;
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--stale-color); border: 2px solid var(--panel-bg);
+  }
 
   /* Its own separate panel, not merged into the legend box — stacked below
      it by .legend-wrap instead. Three independent chips (rather than one
@@ -194,6 +204,23 @@
     opacity: 0.4; transition: opacity var(--dur-fast) ease;
   }
   .filter-toggle.active { opacity: 1; }
+
+  /* Designed state instead of a transient toast — stays visible for as
+     long as the condition holds (an active filter with nothing to show),
+     not a timed message that disappears whether or not anything changed. */
+  .filter-empty-hint {
+    align-self: flex-end;
+    max-width: 180px; text-align: right;
+    background: var(--panel-bg); color: var(--freshness-color);
+    padding: 6px 12px; border-radius: 14px;
+    font-size: 11px; line-height: 1.4;
+    box-shadow: 0 2px 10px rgba(0,0,0,.18);
+    max-height: 60px; opacity: 1;
+    overflow: hidden;
+    transition: max-height var(--dur-fast) ease, opacity var(--dur-fast) ease, margin-top var(--dur-fast) ease;
+  }
+  .filter-empty-hint:empty { max-height: 0; opacity: 0; margin-top: -8px; padding: 0 12px; }
+  .filter-empty-hint:not(:empty) { margin-top: 0; }
 
   .freshness {
     position: absolute; z-index: 1000;
@@ -336,6 +363,7 @@
     <button class="filter-toggle" id="filterJams" data-filter="jams" aria-label="Toggle crowdsourced jams">🚗</button>
     <button class="filter-toggle" id="filterWorks" data-filter="works" aria-label="Toggle road works">🚧</button>
   </div>
+  <div class="filter-empty-hint" id="filterEmptyHint"></div>
 </div>
 
 <div class="backdrop" id="backdrop"></div>
@@ -482,6 +510,20 @@ const filterLayers = {
   works: L.markerClusterGroup(CLUSTER_OPTS),
 };
 const filterVisible = { closures: false, hazards: false, jams: false, works: false };
+const FILTER_LABELS = { closures: 'road closures', hazards: 'hazards or accidents', jams: 'traffic jams', works: 'road works' };
+const filterEmptyHint = document.getElementById('filterEmptyHint');
+
+// Reflects one active-but-empty filter at a time (checked in a fixed
+// order) rather than trying to list several simultaneously — re-run after
+// every toggle and every data refresh, since "empty" can change either way
+// without the user touching anything.
+function updateFilterEmptyHint() {
+  const emptyKey = Object.keys(filterVisible).find(
+    key => filterVisible[key] && filterLayers[key].getLayers().length === 0
+  );
+  filterEmptyHint.textContent = emptyKey ? `No ${FILTER_LABELS[emptyKey]} reported right now` : '';
+}
+
 document.querySelectorAll('.filter-toggle').forEach((btn) => {
   const key = btn.dataset.filter;
   btn.addEventListener('click', () => {
@@ -490,6 +532,7 @@ document.querySelectorAll('.filter-toggle').forEach((btn) => {
     btn.classList.toggle('active', filterVisible[key]);
     if (filterVisible[key]) map.addLayer(filterLayers[key]);
     else fadeGroupOut(map, filterLayers[key]);
+    updateFilterEmptyHint();
   });
 });
 
@@ -817,7 +860,7 @@ function doLocate() {
 locateBtn.addEventListener('click', () => { haptic(); doLocate(); });
 
 map.on('locationfound', (e) => {
-  locateBtn.classList.remove('locating');
+  locateBtn.classList.remove('locating', 'denied');
   locationOutcome = 'found';
   if (userMarker) map.removeLayer(userMarker);
   userMarker = L.circleMarker(e.latlng, {
@@ -828,6 +871,11 @@ map.on('locationfound', (e) => {
 map.on('locationerror', (e) => {
   locateBtn.classList.remove('locating');
   locationOutcome = 'error';
+  // Permission denial specifically gets a persistent marker on the button
+  // itself (see .locate-btn.denied) rather than relying only on this toast,
+  // which is gone in a couple seconds — so it's still visible if you check
+  // back later, not just at the moment it happened.
+  if (e.code === 1) locateBtn.classList.add('denied');
   showToast(
     e.code === 1 ? 'Location permission denied' : 'Could not get your location'
   );
@@ -1085,6 +1133,7 @@ function loadData() {
         pathBounds = bounds;
         if (locationOutcome === 'error') map.fitBounds(pathBounds, { padding: [20, 20] });
       }
+      updateFilterEmptyHint();
     })
     .catch(err => {
       console.error('Failed to load latest.json:', err);

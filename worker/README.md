@@ -24,29 +24,50 @@ reference / redeploying from scratch if ever needed.
    Bindings → Add binding. Variable name must be exactly `TRAFFIC_KV`, bound
    to the namespace you created in step 2.
 
-5. **Add the Cron Trigger**: Worker → Settings → Triggers → Cron Triggers →
-   Add Cron Trigger. Currently set to `*/5 * * * *` (every 5 minutes) —
-   tighter than the old poll cadence since there's no CDN cache fighting it
-   anymore, though the source feed itself won't update faster than every
-   few minutes anyway. Confirmed firing correctly via Observability → filter
-   to "Invocations" → look for `Trigger: cron`.
+5. **Add two Cron Triggers**: Worker → Settings → Triggers → Cron Triggers →
+   Add Cron Trigger.
+   - `*/5 * * * *` (every 5 minutes) — live speed/travel-time plus Waze
+     alerts/jams and official situations. Tighter than the old poll cadence
+     since there's no CDN cache fighting it anymore, though the source feed
+     itself won't update faster than every few minutes anyway.
+   - `0 */6 * * *` (4x/day) — re-fetches and re-parses road geometry, which
+     the 5-min tick instead reads from a cached copy in KV (see "Note on
+     Workers' CPU time limit" below for why). Must match `GEOMETRY_CRON` in
+     `worker.js` exactly.
 
-6. **Deploy**, then visit `https://<worker-name>.<your-subdomain>.workers.dev/refresh`
+   Confirmed firing correctly via Observability → filter to "Invocations" →
+   look for `Trigger: cron`.
+
+6. **Add the `REFRESH_KEY` secret**: Worker → Settings → Variables and
+   Secrets → Add → type **Secret** → name `REFRESH_KEY` → any value you
+   choose. `/refresh` 401s without it (see step 7) — it forces an extra
+   upstream fetch and burns CPU time, so it's not left open to anyone with
+   the URL.
+
+7. **Deploy**, then visit
+   `https://<worker-name>.<your-subdomain>.workers.dev/refresh?key=<your REFRESH_KEY>`
    once in a browser — this seeds KV immediately rather than waiting for the
    first Cron Trigger to fire.
 
-7. **Verify**: `https://<worker-name>.<your-subdomain>.workers.dev/latest.json`
+8. **Verify**: `https://<worker-name>.<your-subdomain>.workers.dev/latest.json`
    should return the joined snapshot instantly (no deploy/cache lag).
 
-8. ~~Once confirmed working, update `preview/index.html`'s `fetch('latest.json')`
+9. ~~Once confirmed working, update `preview/index.html`'s `fetch('latest.json')`
    to point at that Worker URL instead of the local file, and retire the
    `poll.yml` GitHub Action + committed `preview/latest.json`.~~ **Done.**
 
 ## Note on Workers' CPU time limit
 
-The free plan caps CPU time per request (historically ~10ms). A Python
-prototype of the same parsing logic took ~24ms — turned out to be a non-issue
-in practice: `/refresh` returns successfully in the real Workers runtime
-(V8's regex engine is evidently fast enough), confirmed against production
-traffic (431 paths, 419 with live data, matching the old Python poller's
-output exactly).
+The free plan caps CPU time per request at ~10ms — this **is** a real
+constraint, not just a theoretical one. Regex-parsing all 5 feeds
+(geometry + live + Waze alerts + Waze jams + situations) every 5-min tick
+eventually exceeded it, causing `scheduled()` to fail with `exceededCpu` on
+every single invocation and freezing KV on stale data for hours before it
+was noticed. The fix wasn't reducing feature scope — it was recognizing
+that road geometry (the single heaviest parse, touching every one of ~430
+roads) barely ever changes, so it didn't need re-parsing every 5 minutes at
+all. Moving it to its own 4x/day cron (see step 5) and caching the result
+in KV freed up enough budget for the 5-min tick to comfortably handle the
+other 4 feeds. If `exceededCpu` errors show up again in Observability
+Logs, that's the first place to look — either something got heavier again,
+or it's time to consider the Workers Paid plan (raises the CPU cap to 30s).
