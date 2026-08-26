@@ -31,6 +31,17 @@
     --locate-active-bg: #eee;
     --locate-stroke: #1a1a2e;
     --loading-bg: rgba(255,255,255,0.5);
+    /* Roughly matches each basemap's own dominant tone (CARTO Voyager's
+       cream / dark_all's near-black) so the map area isn't stark white
+       while tiles are still loading in — a themed placeholder instead of a
+       flash of default browser background. */
+    --map-placeholder-bg: #e8e6dd;
+    /* Two durations reused everywhere instead of one-off values per rule
+       (was a mix of 150/200/220/250ms scattered around) — micro-interactions
+       (toggles, chevrons) use fast, anything that moves a larger chunk of UI
+       (sheet, backdrop, loading overlay) uses base. */
+    --dur-fast: 150ms;
+    --dur-base: 220ms;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
@@ -47,6 +58,7 @@
       --locate-active-bg: #3a3a42;
       --locate-stroke: #eee;
       --loading-bg: rgba(20,20,24,0.5);
+      --map-placeholder-bg: #1a1a1e;
     }
   }
   :root[data-theme="dark"] {
@@ -63,10 +75,12 @@
     --locate-active-bg: #3a3a42;
     --locate-stroke: #eee;
     --loading-bg: rgba(20,20,24,0.5);
+    --map-placeholder-bg: #1a1a1e;
   }
 
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body, #map { height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
+  #map { background: var(--map-placeholder-bg); }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 
   /* Holds the legend and the events toggle as two separate stacked panels
@@ -97,14 +111,14 @@
     display: flex; align-items: center; justify-content: space-between;
     font-weight: 600; cursor: pointer; user-select: none;
   }
-  .legend-header .chevron { transition: transform 150ms ease; }
+  .legend-header .chevron { transition: transform var(--dur-fast) ease; }
   .legend.collapsed .legend-header .chevron { transform: rotate(-90deg); }
   .legend .legend-body {
     display: block; /* .legend div{display:flex} would otherwise turn this
       wrapper itself into a row flex container, laying its row children out
       side-by-side instead of stacked */
     overflow: hidden; max-height: 400px;
-    transition: max-height 200ms ease, opacity 150ms ease, margin-top 200ms ease;
+    transition: max-height var(--dur-fast) ease, opacity var(--dur-fast) ease, margin-top var(--dur-fast) ease;
     margin-top: 6px; opacity: 1;
   }
   .legend.collapsed .legend-body { max-height: 0; opacity: 0; margin-top: 0; }
@@ -118,7 +132,7 @@
     box-shadow: 0 -4px 20px rgba(0,0,0,.2);
     padding: 10px 20px calc(env(safe-area-inset-bottom, 0px) + 24px);
     transform: translateY(110%);
-    transition: transform 220ms ease;
+    transition: transform var(--dur-base) ease;
   }
   .sheet.open { transform: translateY(0); }
   .sheet-handle {
@@ -141,7 +155,7 @@
     position: fixed; inset: 0; z-index: 1500;
     background: rgba(0,0,0,0.15);
     opacity: 0; pointer-events: none;
-    transition: opacity 220ms ease;
+    transition: opacity var(--dur-base) ease;
   }
   .backdrop.open { opacity: 1; }
 
@@ -177,7 +191,7 @@
     width: 44px; height: 44px; font-size: 17px;
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
     display: flex; align-items: center; justify-content: center;
-    opacity: 0.4; transition: opacity 150ms ease;
+    opacity: 0.4; transition: opacity var(--dur-fast) ease;
   }
   .filter-toggle.active { opacity: 1; }
 
@@ -218,7 +232,7 @@
     background: rgba(20,20,20,0.92); color: white;
     padding: 10px 16px; border-radius: 10px; font-size: 14px;
     z-index: 3000; opacity: 0; pointer-events: none;
-    transition: opacity 200ms ease, transform 200ms ease;
+    transition: opacity var(--dur-fast) ease, transform var(--dur-fast) ease;
     white-space: nowrap;
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -230,7 +244,19 @@
     border: 2px solid white; box-shadow: 0 1px 4px rgba(0,0,0,.4);
     display: flex; align-items: center; justify-content: center;
     font-size: 17px; line-height: 1;
+    animation: marker-in 220ms ease-out;
   }
+  @keyframes marker-in {
+    from { transform: scale(0.3); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+
+  /* Instant, JS-driven press feedback (touchstart/touchend) instead of
+     relying on CSS :active — mobile browsers can delay :active while they
+     disambiguate a tap from the start of a scroll, which reads as sluggish
+     on a button that's meant to feel immediate. */
+  .pressable { transition: transform 80ms ease, opacity 80ms ease; }
+  .pressable.pressed { transform: scale(0.9); opacity: 0.7; }
 
   .legend .divider { height: 1px; background: var(--divider-color); margin: 6px 0; }
   .legend .swatch-line { width: 14px; height: 4px; border-radius: 2px; margin-right: 8px; }
@@ -251,7 +277,7 @@
     position: absolute; inset: 0; z-index: 1800;
     display: flex; align-items: center; justify-content: center;
     background: var(--loading-bg);
-    opacity: 1; transition: opacity 250ms ease;
+    opacity: 1; transition: opacity var(--dur-base) ease;
     pointer-events: none;
   }
   .loading-overlay.hidden { opacity: 0; }
@@ -344,9 +370,47 @@ if (!EVENTS_ENABLED) {
   document.querySelectorAll('.event-legend').forEach(el => el.style.display = 'none');
 }
 
+// Short tap buzz on real actions (filter toggles, marker taps, etc — wired
+// at each call site below), not on every touchstart. iOS Safari has never
+// implemented the Vibration API at all, so this silently no-ops there.
+function haptic(ms = 10) {
+  if (navigator.vibrate) navigator.vibrate(ms);
+}
+
+// Instant visual press feedback via touchstart/touchend instead of relying
+// on CSS :active, which mobile browsers can delay while disambiguating a
+// tap from the start of a scroll — applied generically here rather than
+// wiring each button's markup by hand.
+document.querySelectorAll('.filter-toggle, .zoom-btn, .locate-btn, .cvd-toggle, .theme-toggle, .sheet-close').forEach(el => {
+  el.classList.add('pressable');
+  el.addEventListener('touchstart', () => el.classList.add('pressed'), { passive: true });
+  ['touchend', 'touchcancel'].forEach(evt => el.addEventListener(evt, () => el.classList.remove('pressed')));
+});
+
+// Remembers where the user last left the map (center + zoom), so reopening
+// the app doesn't always reset to the same country-wide default view — a
+// successful geolocation below still wins and recenters on request, this
+// only changes what's shown before/instead of that.
+const SAVED_VIEW_KEY = 'lastView';
+function loadSavedView() {
+  try {
+    const v = JSON.parse(localStorage.getItem(SAVED_VIEW_KEY));
+    if (v && typeof v.lat === 'number' && typeof v.lng === 'number' && typeof v.zoom === 'number') return v;
+  } catch (e) { /* corrupt/missing — fall through to no saved view */ }
+  return null;
+}
+const savedView = loadSavedView();
+
 // Canvas instead of the SVG default: with 429 roads x 2 lines each plus jam
 // segments, canvas rendering keeps pan/zoom noticeably smoother on phones.
-const map = L.map('map', { zoomControl: false, tap: true, renderer: L.canvas() }).setView([35.05, 33.15], 9);
+const map = L.map('map', { zoomControl: false, tap: true, renderer: L.canvas() }).setView(
+  savedView ? [savedView.lat, savedView.lng] : [35.05, 33.15],
+  savedView ? savedView.zoom : 9
+);
+map.on('moveend', () => {
+  const c = map.getCenter();
+  localStorage.setItem(SAVED_VIEW_KEY, JSON.stringify({ lat: c.lat, lng: c.lng, zoom: map.getZoom() }));
+});
 
 // Theme: system preference by default, overridable via the toggle button
 // (persisted in localStorage). The override is applied as a data-theme
@@ -367,6 +431,9 @@ function applyBasemap(theme) {
     subdomains: 'abcd',
     maxZoom: 20
   }).addTo(map);
+  // Only meaningful the first time (see maybeRevealMap) — a later theme
+  // toggle firing this again is harmless, tilesReady is already true by then.
+  basemapLayer.once('load', () => { tilesReady = true; maybeRevealMap(); });
 }
 
 const themeToggleBtn = document.getElementById('themeToggle');
@@ -378,6 +445,7 @@ function applyTheme(theme) {
 applyTheme(currentTheme());
 themeToggleBtn.addEventListener('click', (e) => {
   e.stopPropagation();
+  haptic();
   const next = currentTheme() === 'dark' ? 'light' : 'dark';
   localStorage.setItem('theme', next);
   applyTheme(next);
@@ -417,10 +485,11 @@ const filterVisible = { closures: false, hazards: false, jams: false, works: fal
 document.querySelectorAll('.filter-toggle').forEach((btn) => {
   const key = btn.dataset.filter;
   btn.addEventListener('click', () => {
+    haptic();
     filterVisible[key] = !filterVisible[key];
     btn.classList.toggle('active', filterVisible[key]);
     if (filterVisible[key]) map.addLayer(filterLayers[key]);
-    else map.removeLayer(filterLayers[key]);
+    else fadeGroupOut(map, filterLayers[key]);
   });
 });
 
@@ -443,6 +512,89 @@ function colorFor(speed) {
   return p.slow;
 }
 
+// Roads render on a canvas, not DOM elements, so a plain CSS transition
+// can't animate their color the way it can for the panels/buttons above —
+// a color change on refresh used to just snap instantly. Manually
+// interpolating over a few frames instead makes a speed change read as
+// "the data updated" rather than "the map glitched."
+function lerpColor(a, b, t) {
+  const pa = [1, 3, 5].map(i => parseInt(a.substr(i, 2), 16));
+  const pb = [1, 3, 5].map(i => parseInt(b.substr(i, 2), 16));
+  const c = pa.map((v, i) => Math.round(v + (pb[i] - v) * t));
+  return '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
+}
+function animateColor(layer, fromColor, toColor, duration = 300) {
+  if (fromColor === toColor) return;
+  const start = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - start) / duration);
+    layer.setStyle({ color: lerpColor(fromColor, toColor, t) });
+    if (t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+// Mirrors marker-in (CSS) — a marker's icon is a real DOM element (divIcon),
+// so its removal can shrink/fade the same way it grew in, instead of
+// vanishing instantly like it used to.
+function fadeOutMarker(layerGroup, marker, duration = 200) {
+  const el = marker.getElement && marker.getElement();
+  const inner = el && el.querySelector('.report-marker');
+  if (!inner) { layerGroup.removeLayer(marker); return; }
+  inner.style.transition = `transform ${duration}ms ease, opacity ${duration}ms ease`;
+  inner.style.transform = 'scale(0.3)';
+  inner.style.opacity = '0';
+  setTimeout(() => layerGroup.removeLayer(marker), duration);
+}
+
+// Lines render on canvas (see the map's `renderer` option), not as DOM
+// elements — no CSS transition to hook, so the fade is manually stepped via
+// rAF instead, same technique as animateColor but for opacity.
+function fadeOutLine(layerGroup, line, duration = 200) {
+  const startOpacity = line.options.opacity != null ? line.options.opacity : 1;
+  const start = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - start) / duration);
+    line.setStyle({ opacity: startOpacity * (1 - t) });
+    if (t < 1) requestAnimationFrame(step);
+    else layerGroup.removeLayer(line);
+  }
+  requestAnimationFrame(step);
+}
+
+// Toggling a filter chip off used to call map.removeLayer(group) directly —
+// instant, bypassing fadeOutMarker/fadeOutLine entirely (those only fire
+// when an item genuinely drops out of the data between polls, a much rarer
+// event than a user tapping a filter chip). Fades every marker/line the
+// group actually contains — via eachLayer, which markercluster documents as
+// walking every real marker regardless of current clustering state — then
+// detaches the group once that's had time to play. Markers currently hidden
+// inside a cluster bubble have no individual DOM element to fade and just
+// disappear with the group at the end, same as before.
+function fadeGroupOut(map, group, duration = 200) {
+  group.eachLayer(layer => {
+    if (layer.getElement) {
+      const el = layer.getElement();
+      const inner = el && el.querySelector('.report-marker');
+      if (inner) {
+        inner.style.transition = `transform ${duration}ms ease, opacity ${duration}ms ease`;
+        inner.style.transform = 'scale(0.3)';
+        inner.style.opacity = '0';
+      }
+    } else if (layer.setStyle) {
+      const startOpacity = layer.options.opacity != null ? layer.options.opacity : 1;
+      const start = performance.now();
+      function step(now) {
+        const t = Math.min(1, (now - start) / duration);
+        layer.setStyle({ opacity: startOpacity * (1 - t) });
+        if (t < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+  });
+  setTimeout(() => map.removeLayer(group), duration);
+}
+
 const cvdToggleBtn = document.getElementById('cvdToggle');
 const legendFastEl = document.getElementById('legendFast');
 const legendModerateEl = document.getElementById('legendModerate');
@@ -455,13 +607,17 @@ function applyPaletteToLegend() {
 }
 cvdToggleBtn.addEventListener('click', (e) => {
   e.stopPropagation(); // lives inside the legend header — don't also toggle collapse
+  haptic();
   colorblindMode = !colorblindMode;
   cvdToggleBtn.classList.toggle('active', colorblindMode);
   applyPaletteToLegend();
-  // Recolor every already-drawn road in place — a fresh loadData() would
-  // also pick up the new palette, but that's up to 3 minutes away.
+  // Recolor every already-drawn road in place — instantly, not animated,
+  // since this is a manual palette switch, not a data update. Also updates
+  // entry.color (the animateColor baseline in loadData above) so the next
+  // refresh doesn't animate back from the pre-toggle color.
   for (const entry of layersById.values()) {
-    entry.visible.setStyle({ color: colorFor(entry.hit.speedKmh) });
+    entry.color = colorFor(entry.hit.speedKmh);
+    entry.visible.setStyle({ color: entry.color });
   }
 });
 
@@ -564,6 +720,7 @@ function reportMarker(lat, lon, color, symbol, onClick, targetLayer) {
   }).addTo(targetLayer);
   marker.on('click', (e) => {
     L.DomEvent.stopPropagation(e);
+    haptic();
     onClick();
   });
   return marker;
@@ -614,7 +771,7 @@ function openClosureSheet(rc) {
   `;
   showSheet();
 }
-sheetClose.addEventListener('click', closeSheet);
+sheetClose.addEventListener('click', () => { haptic(); closeSheet(); });
 // The backdrop no longer blocks touches (map must stay pannable/zoomable
 // while the sheet is open), so tapping empty map space is what now closes
 // it — each road's own click handler stops propagation so opening a sheet
@@ -635,8 +792,8 @@ function showToast(msg) {
 // language rather than mixing in Leaflet's default skin.
 const zoomInBtn = document.getElementById('zoomInBtn');
 const zoomOutBtn = document.getElementById('zoomOutBtn');
-zoomInBtn.addEventListener('click', (e) => { e.stopPropagation(); map.zoomIn(); });
-zoomOutBtn.addEventListener('click', (e) => { e.stopPropagation(); map.zoomOut(); });
+zoomInBtn.addEventListener('click', (e) => { e.stopPropagation(); haptic(); map.zoomIn(); });
+zoomOutBtn.addEventListener('click', (e) => { e.stopPropagation(); haptic(); map.zoomOut(); });
 function updateZoomButtons() {
   zoomInBtn.classList.toggle('disabled', map.getZoom() >= map.getMaxZoom());
   zoomOutBtn.classList.toggle('disabled', map.getZoom() <= map.getMinZoom());
@@ -657,7 +814,7 @@ function doLocate() {
   locateBtn.classList.add('locating');
   map.locate({ setView: true, maxZoom: 15, enableHighAccuracy: true, timeout: 10000 });
 }
-locateBtn.addEventListener('click', doLocate);
+locateBtn.addEventListener('click', () => { haptic(); doLocate(); });
 
 map.on('locationfound', (e) => {
   locateBtn.classList.remove('locating');
@@ -674,7 +831,10 @@ map.on('locationerror', (e) => {
   showToast(
     e.code === 1 ? 'Location permission denied' : 'Could not get your location'
   );
-  if (pathBounds) map.fitBounds(pathBounds, { padding: [20, 20] });
+  // Only zoom out to fit every road if there was nowhere better to fall
+  // back to — a saved view (see above) already put the map somewhere more
+  // useful than the whole island before geolocation was even attempted.
+  if (!savedView && pathBounds) map.fitBounds(pathBounds, { padding: [20, 20] });
 });
 
 // Try to center on the user as soon as the app opens, no tap required —
@@ -688,16 +848,27 @@ if (location.protocol !== 'file:') {
 const DATA_URL = 'https://cyprus-live-traffic.tsiakkaris-andreas.workers.dev/latest.json';
 const REFRESH_INTERVAL_MS = 3 * 60 * 1000; // keep pace with the Worker's 5-min cron without over-fetching
 
-// Hidden the moment the first fetch settles, success or failure — a fetch
-// error already gets its own toast, so this just stops the spinner from
-// spinning forever rather than adding a second error surface.
+// Waits for both the first data fetch AND the basemap's initial tiles to be
+// in place before revealing the map — hiding the spinner on data alone used
+// to sometimes uncover still-loading/blank tiles underneath (a "hard cut"
+// to an unfinished map), instead of one clean reveal once there's actually
+// something worth looking at. A timeout is the safety net in case a tile
+// request never resolves (aborted by a pan, dropped connection, etc.) —
+// better to reveal a slightly-incomplete map than get stuck spinning.
 const loadingOverlay = document.getElementById('loadingOverlay');
 let firstLoadSettled = false;
-function hideLoadingOverlay() {
-  if (firstLoadSettled) return;
+let dataReady = false;
+let tilesReady = false;
+function maybeRevealMap() {
+  if (firstLoadSettled || !dataReady || !tilesReady) return;
   firstLoadSettled = true;
   loadingOverlay.classList.add('hidden');
 }
+function hideLoadingOverlay() {
+  dataReady = true;
+  maybeRevealMap();
+}
+setTimeout(() => { tilesReady = true; maybeRevealMap(); }, 4000);
 
 const layersById = new Map();
 const alertsById = new Map();
@@ -761,11 +932,13 @@ function loadData() {
         seenIds.add(p.id);
         const latlngs = p.coords.map(c => [c[0], c[1]]);
         let entry = layersById.get(p.id);
+        const newColor = colorFor(p.speed_kmh);
         if (entry) {
           // Update in place — re-drawing 431 fresh polylines every refresh
           // would flicker and drop whatever the user was mid-interaction
           // with (e.g. an open bottom sheet).
-          entry.visible.setStyle({ color: colorFor(p.speed_kmh) });
+          animateColor(entry.visible, entry.color, newColor);
+          entry.color = newColor;
           entry.hit.speedKmh = p.speed_kmh;
           entry.hit.travelTimeS = p.travel_time_s;
         } else {
@@ -774,7 +947,7 @@ function loadData() {
           // the visible line alone is too thin a target to tap reliably,
           // especially zoomed out.
           const visible = L.polyline(latlngs, {
-            color: colorFor(p.speed_kmh), weight: 5, opacity: 0.85,
+            color: newColor, weight: 5, opacity: 0.85,
             interactive: false
           }).addTo(map);
           const hit = L.polyline(latlngs, {
@@ -784,9 +957,10 @@ function loadData() {
           hit.travelTimeS = p.travel_time_s;
           hit.on('click', (e) => {
             L.DomEvent.stopPropagation(e); // don't let this bubble to the map's own click-to-close handler
+            haptic();
             openSheet(hit.speedKmh, hit.travelTimeS);
           });
-          entry = { visible, hit };
+          entry = { visible, hit, color: newColor };
           layersById.set(p.id, entry);
         }
         latlngs.forEach(ll => bounds.push(ll));
@@ -798,8 +972,8 @@ function loadData() {
       // adds or updates, never deletes.
       for (const [id, entry] of layersById) {
         if (!seenIds.has(id)) {
-          map.removeLayer(entry.visible);
-          map.removeLayer(entry.hit);
+          fadeOutLine(map, entry.visible);
+          map.removeLayer(entry.hit); // invisible hit target, nothing to visibly fade
           layersById.delete(id);
         }
       }
@@ -823,7 +997,7 @@ function loadData() {
       });
       for (const [id, entry] of alertsById) {
         if (!seenAlertIds.has(id)) {
-          entry.layer.removeLayer(entry.marker);
+          fadeOutMarker(entry.layer, entry.marker);
           alertsById.delete(id);
         }
       }
@@ -844,7 +1018,7 @@ function loadData() {
         const line = L.polyline(latlngs, {
           color: closureStyle.color, weight: 5, opacity: 0.85, dashArray: '2,8'
         }).addTo(filterLayers.closures);
-        line.on('click', (e) => { L.DomEvent.stopPropagation(e); openClosureSheet(rc); });
+        line.on('click', (e) => { L.DomEvent.stopPropagation(e); haptic(); openClosureSheet(rc); });
         const endpoints = [rc.points[0], rc.points[rc.points.length - 1]];
         const markers = endpoints.map(p =>
           reportMarker(p.lat, p.lon, closureStyle.color, closureStyle.symbol, () => openClosureSheet(rc), filterLayers.closures)
@@ -853,8 +1027,8 @@ function loadData() {
       });
       for (const [id, entry] of roadClosuresById) {
         if (!seenClosureIds.has(id)) {
-          filterLayers.closures.removeLayer(entry.line);
-          entry.markers.forEach(m => filterLayers.closures.removeLayer(m));
+          fadeOutLine(filterLayers.closures, entry.line);
+          entry.markers.forEach(m => fadeOutMarker(filterLayers.closures, m));
           roadClosuresById.delete(id);
         }
       }
@@ -876,6 +1050,7 @@ function loadData() {
           line.jamData = j;
           line.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
+            haptic();
             openJamSheet(line.jamData);
           });
           jamsById.set(j.id, line);
@@ -883,7 +1058,7 @@ function loadData() {
       });
       for (const [id, line] of jamsById) {
         if (!seenJamIds.has(id)) {
-          filterLayers.jams.removeLayer(line);
+          fadeOutLine(filterLayers.jams, line);
           jamsById.delete(id);
         }
       }
@@ -900,7 +1075,7 @@ function loadData() {
       });
       for (const [id, marker] of situationsById) {
         if (!seenSituationIds.has(id)) {
-          filterLayers.works.removeLayer(marker);
+          fadeOutMarker(filterLayers.works, marker);
           situationsById.delete(id);
         }
       }

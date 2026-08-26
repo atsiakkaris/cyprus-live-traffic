@@ -31,7 +31,17 @@ const TS_RE = /<measurement_timestamp[^>]*>([^<]*)<\/measurement_timestamp>/;
 const TRAFFIC_ELEMENT_RE = /<traffic:trafficElement>([\s\S]*?)<\/traffic:trafficElement>/g;
 const COMMENT_RE = /<common:commentType>([^<]*)<\/common:commentType>\s*<common:value>([^<]*)<\/common:value>/g;
 const POINT_COORDS_RE = /<location:pointCoordinates>\s*<common:latitude>([^<]*)<\/common:latitude>\s*<common:longitude>([^<]*)<\/common:longitude>\s*<\/location:pointCoordinates>/;
-const LAT_LON_RE = /<common:latitude>([^<]*)<\/common:latitude>\s*<common:longitude>([^<]*)<\/common:longitude>/g;
+// waze_traffic's <location:linear> wraps its points by role rather than by
+// path order: <startPointCoordinates>, then <endPointCoordinates>, then the
+// <intermediatePointCoordinates> list — in that document order, endpoint
+// before the intermediates. A plain "every lat/lon in document order" match
+// (the old LAT_LON_RE) therefore draws start -> end -> intermediate 1..N,
+// a straight jump across the jam followed by a loop back through the real
+// path, instead of following the road. These three match by role so the
+// caller can reassemble them into actual path order.
+const START_POINT_RE = /<location:startPointCoordinates>\s*<common:latitude>([^<]*)<\/common:latitude>\s*<common:longitude>([^<]*)<\/common:longitude>\s*<\/location:startPointCoordinates>/;
+const END_POINT_RE = /<location:endPointCoordinates>\s*<common:latitude>([^<]*)<\/common:latitude>\s*<common:longitude>([^<]*)<\/common:longitude>\s*<\/location:endPointCoordinates>/;
+const INTERMEDIATE_POINT_RE = /<location:intermediatePointCoordinates>\s*<common:latitude>([^<]*)<\/common:latitude>\s*<common:longitude>([^<]*)<\/common:longitude>\s*<\/location:intermediatePointCoordinates>/g;
 
 // SituationPublication (road works, obstructions, lane closures): repeated
 // <q1:situationRecord> blocks with an xsi:type, severity, optional free-text
@@ -233,9 +243,16 @@ function parseWazeTraffic(text) {
     const idMatch = /<common:id>([^<]*)<\/common:id>/.exec(block);
     const linearMatch = /<location:linear>([\s\S]*?)<\/location:linear>/.exec(block);
     if (!idMatch || !linearMatch) continue;
-    const coords = [...linearMatch[1].matchAll(LAT_LON_RE)]
-      .map((p) => [parseFloat(p[1]), parseFloat(p[2])])
-      .filter((p) => !Number.isNaN(p[0]) && !Number.isNaN(p[1]));
+    const linear = linearMatch[1];
+    const startMatch = START_POINT_RE.exec(linear);
+    const endMatch = END_POINT_RE.exec(linear);
+    if (!startMatch || !endMatch) continue;
+    const intermediates = [...linear.matchAll(INTERMEDIATE_POINT_RE)].map((p) => [parseFloat(p[1]), parseFloat(p[2])]);
+    const coords = [
+      [parseFloat(startMatch[1]), parseFloat(startMatch[2])],
+      ...intermediates,
+      [parseFloat(endMatch[1]), parseFloat(endMatch[2])],
+    ].filter((p) => !Number.isNaN(p[0]) && !Number.isNaN(p[1]));
     if (coords.length < 2) continue;
     const c = commentsOf(block);
     jams.push({
