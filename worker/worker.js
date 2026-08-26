@@ -56,6 +56,23 @@ const SITUATION_POINT_RE = /<\w+:latitude>([^<]*)<\/\w+:latitude>\s*<\w+:longitu
 const OVERALL_START_RE = /<overallStartTime>([^<]*)<\/overallStartTime>/;
 const OVERALL_END_RE = /<overallEndTime>([^<]*)<\/overallEndTime>/;
 
+// Hoisted rather than written as literals inside the per-element parse loops
+// below — those run hundreds of times per tick, and the CPU budget here is
+// genuinely tight (see the exceededCpu note in README).
+const COMMON_ID_RE = /<common:id>([^<]*)<\/common:id>/;
+const LINEAR_RE = /<location:linear>([\s\S]*?)<\/location:linear>/;
+
+// Upstream returning a 4xx/5xx with an HTML error body is not an exception —
+// `.text()` resolves happily and the parsers below then find nothing, which
+// looks identical to "the feed is legitimately empty". Treating a bad status
+// as a throw is what lets fetchAndParse's catch and the snapshot health
+// checks actually see the failure.
+async function fetchText(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} returned HTTP ${res.status}`);
+  return res.text();
+}
+
 function commentsOf(block) {
   const comments = {};
   for (const m of block.matchAll(COMMENT_RE)) comments[m[1]] = unescapeXml(m[2]);
@@ -124,7 +141,7 @@ function parseWazeAlerts(text) {
   const alerts = [];
   for (const m of text.matchAll(TRAFFIC_ELEMENT_RE)) {
     const block = m[1];
-    const idMatch = /<common:id>([^<]*)<\/common:id>/.exec(block);
+    const idMatch = COMMON_ID_RE.exec(block);
     const pointMatch = POINT_COORDS_RE.exec(block);
     if (!idMatch || !pointMatch) continue;
     const c = commentsOf(block);
@@ -240,8 +257,8 @@ function parseWazeTraffic(text) {
   const jams = [];
   for (const m of text.matchAll(TRAFFIC_ELEMENT_RE)) {
     const block = m[1];
-    const idMatch = /<common:id>([^<]*)<\/common:id>/.exec(block);
-    const linearMatch = /<location:linear>([\s\S]*?)<\/location:linear>/.exec(block);
+    const idMatch = COMMON_ID_RE.exec(block);
+    const linearMatch = LINEAR_RE.exec(block);
     if (!idMatch || !linearMatch) continue;
     const linear = linearMatch[1];
     const startMatch = START_POINT_RE.exec(linear);
@@ -301,13 +318,35 @@ function parseSituations(text) {
 // which would otherwise also wipe the core road-speed data on every refresh.
 async function fetchAndParse(url, parse, label) {
   try {
-    const text = await fetch(url).then((r) => r.text());
-    return parse(text);
+    return parse(await fetchText(url));
   } catch (err) {
     console.error(`Failed to fetch/parse ${label}: ${err}`);
     return [];
   }
 }
+
+// Sanity floor for a healthy snapshot. Normal runs return ~429 paths; a
+// broken upstream fetch (e.g. an expired TLS cert causing a malformed or
+// empty response instead of a thrown error) can silently parse down to 0
+// with no exception raised at all. Refusing to write anything below this
+// floor means a bad upstream response degrades to "serve the last known
+// good snapshot" instead of wiping the live app blank for every user.
+const MIN_HEALTHY_PATH_COUNT = 50;
+
+// Path count alone stopped being a meaningful health signal once geometry
+// moved to the KV cache: it reflects the *cached* road list, so it stays at
+// ~429 even when the live-speed feed returns nothing at all, letting an
+// all-grey "no data" snapshot sail past the floor above and overwrite a
+// perfectly good one. This ratio is the check that actually looks at the
+// live feed.
+//
+// Healthy runs sit at 97-100% matched (worst recorded: 419/431 = 97.2%), so
+// 0.8 keeps real headroom below normal while refusing anything badly
+// degraded. Being deliberately ratcheted up as confidence grows — the
+// tradeoff is that a partial upstream degradation now freezes the app on the
+// last good snapshot rather than publishing a half-empty map, which is the
+// safer of the two failure modes but does mean less tolerance for a bad day.
+const MIN_HEALTHY_LIVE_RATIO = 0.8;
 
 // Re-enabled now that geometry is cached (see loadGeometry below) instead of
 // re-parsed every tick — that was the heaviest chunk of the CPU budget that
@@ -321,16 +360,29 @@ const FETCH_EVENTS = true;
 // that's static almost all the time. Cached in KV and only refreshed on its
 // own slower cron (see GEOMETRY_CRON below) instead, so the regular 5-min
 // tick only has to parse the small live-speed feed.
+async function readCachedGeometry(env) {
+  const cached = await env.TRAFFIC_KV.get("geometry");
+  return cached ? new Map(JSON.parse(cached)) : null;
+}
+
 async function fetchAndCacheGeometry(env) {
-  const geometryText = await fetch(GEOMETRY_URL).then((r) => r.text());
-  const geometry = parseGeometry(geometryText);
+  const geometry = parseGeometry(await fetchText(GEOMETRY_URL));
+  // Never overwrite a good cache with a broken fetch. Without this the
+  // geometry cron could persist an empty map, and since every 5-min tick
+  // reads that cache, the app would then sit frozen on its last snapshot
+  // until the next geometry run hours later — a self-inflicted outage that
+  // needs a manual /refresh to clear.
+  if (geometry.size < MIN_HEALTHY_PATH_COUNT) {
+    console.error(`Refusing to cache suspicious geometry: only ${geometry.size} paths — keeping previous cache`);
+    return (await readCachedGeometry(env)) || geometry;
+  }
   await env.TRAFFIC_KV.put("geometry", JSON.stringify([...geometry]));
   return geometry;
 }
 
 async function loadGeometry(env) {
-  const cached = await env.TRAFFIC_KV.get("geometry");
-  if (cached) return new Map(JSON.parse(cached));
+  const cached = await readCachedGeometry(env);
+  if (cached) return cached;
   // No cache yet (first-ever run before the geometry cron has fired once) —
   // fetch it live this one time so the app isn't left with zero paths.
   return fetchAndCacheGeometry(env);
@@ -339,7 +391,7 @@ async function loadGeometry(env) {
 async function buildSnapshot(env, { refreshGeometry = false } = {}) {
   const [geometry, liveText, alertsRaw, jams, situations] = await Promise.all([
     refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
-    fetch(LIVE_URL).then((r) => r.text()),
+    fetchText(LIVE_URL),
     FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication") : Promise.resolve([]),
@@ -400,10 +452,21 @@ const DEPLOYED_HOST = "atsiakkaris.github.io";
 // Categorizes by *what kind* of caller it is, not just the raw host, so it's obvious
 // at a glance whether a hit came from the real deployed app, local file:// testing,
 // a local dev server, or something unrecognized (e.g. curl, a bot, server-to-server).
+// A malformed Origin/Referer must not take the request down with it — this
+// runs on every /latest.json hit, so an unparseable header from some bot
+// would otherwise 500 a request that could have served cached data fine.
+function hostOf(value) {
+  if (!value) return null;
+  if (value === "null") return "file://"; // sandboxed/file:// origins send the literal string
+  try {
+    return new URL(value).host;
+  } catch {
+    return null;
+  }
+}
+
 function describeCaller(request) {
-  const origin = request.headers.get("origin");
-  const referer = request.headers.get("referer");
-  const host = origin === "null" ? "file://" : origin ? new URL(origin).host : (referer ? new URL(referer).host : null);
+  const host = hostOf(request.headers.get("origin")) || hostOf(request.headers.get("referer"));
 
   let category;
   if (host === DEPLOYED_HOST) category = `App (${DEPLOYED_HOST})`;
@@ -426,13 +489,29 @@ function describeCaller(request) {
   return `${category} — ${browser}`;
 }
 
-// Sanity floor for a healthy snapshot. Normal runs return ~429 paths; a
-// broken upstream fetch (e.g. an expired TLS cert causing a malformed or
-// empty response instead of a thrown error) can silently parse down to 0
-// with no exception raised at all. Refusing to write anything below this
-// floor means a bad upstream response degrades to "serve the last known
-// good snapshot" instead of wiping the live app blank for every user.
-const MIN_HEALTHY_PATH_COUNT = 50;
+// Returns a human-readable reason the snapshot looks broken, or null if it's
+// fine to publish. Shared by the cron and /refresh so both apply exactly the
+// same bar — they used to carry near-duplicate copies of this check, which is
+// how the ratio check below could have ended up in only one of them.
+function unhealthyReason(snapshot) {
+  if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
+    return `only ${snapshot.path_count} paths`;
+  }
+  if (snapshot.matched_live_count / snapshot.path_count < MIN_HEALTHY_LIVE_RATIO) {
+    return `only ${snapshot.matched_live_count} of ${snapshot.path_count} paths have live data`;
+  }
+  return null;
+}
+
+async function storeIfHealthy(env, snapshot) {
+  const reason = unhealthyReason(snapshot);
+  if (reason) {
+    console.error(`Refusing to store suspicious snapshot: ${reason} (upstream likely broken)`);
+    return reason;
+  }
+  await env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot));
+  return null;
+}
 
 // Must match the second entry in wrangler.toml's [triggers] crons — the
 // slower schedule that re-fetches/re-parses geometry (see loadGeometry
@@ -440,16 +519,12 @@ const MIN_HEALTHY_PATH_COUNT = 50;
 const GEOMETRY_CRON = "0 */6 * * *";
 
 export default {
-  async scheduled(event, env, ctx) {
+  async scheduled(event, env) {
     const snapshot = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
-    if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
-      console.error(`Refusing to store suspicious snapshot: only ${snapshot.path_count} paths (upstream likely broken)`);
-      return;
-    }
-    await env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot));
+    await storeIfHealthy(env, snapshot);
   },
 
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/refresh") {
@@ -462,14 +537,13 @@ export default {
       }
       console.log(`GET /refresh from ${describeCaller(request)}`);
       const snapshot = await buildSnapshot(env, { refreshGeometry: true });
-      if (snapshot.path_count < MIN_HEALTHY_PATH_COUNT) {
-        console.error(`Refusing to store suspicious snapshot: only ${snapshot.path_count} paths (upstream likely broken)`);
+      const reason = await storeIfHealthy(env, snapshot);
+      if (reason) {
         return new Response(
-          JSON.stringify({ error: "Upstream returned a suspiciously empty/broken feed — last good snapshot kept.", ...snapshot }),
+          JSON.stringify({ error: `Upstream returned a suspiciously broken feed (${reason}) — last good snapshot kept.`, ...snapshot }),
           { status: 502, headers: JSON_HEADERS }
         );
       }
-      await env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot));
       return new Response(JSON.stringify(snapshot), { headers: JSON_HEADERS });
     }
 

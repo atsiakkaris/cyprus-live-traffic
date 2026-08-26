@@ -38,9 +38,13 @@ dependency between them, by design.
   zoom +/- buttons sit above the locate button. Shows a live "data last
   updated" indicator so staleness is never silent.
 - **`poller/`** — the original Python poller. No longer the production data
-  path (the Worker replaced it), but still useful for local testing/dev
-  without needing the deployed Worker — writes `preview/latest.json`
-  (gitignored) for the app to fall back to locally.
+  path (the Worker replaced it), and **roads only**: it predates the Waze
+  alert/jam and official-situation feeds, so the snapshot it writes has no
+  `alerts`, `road_closures`, `jams` or `situations`. The app handles those
+  being absent, so it still runs — every event filter just reports nothing
+  to show. Useful for working on the road/speed layer without the deployed
+  Worker; use `/refresh` on the Worker instead if you need event data.
+  Writes `preview/latest.json` (gitignored).
 
 ## Deployment
 
