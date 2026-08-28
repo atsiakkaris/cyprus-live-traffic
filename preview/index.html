@@ -350,9 +350,9 @@
       </span>
     </div>
     <div class="legend-body">
-      <div><span id="legendFast" style="background:#2ecc71"></span>Fast &gt;60</div>
-      <div><span id="legendModerate" style="background:#f1c40f"></span>Moderate 30–60</div>
-      <div><span id="legendSlow" style="background:#e74c3c"></span>Slow &lt;30</div>
+      <div><span id="legendFast" style="background:#2ecc71"></span>Free flow</div>
+      <div><span id="legendModerate" style="background:#f1c40f"></span>Light–moderate traffic</div>
+      <div><span id="legendSlow" style="background:#e74c3c"></span>Heavy traffic</div>
       <div><span style="background:#95a5a6"></span>No data</div>
       <div class="divider event-legend"></div>
       <div class="event-legend"><span class="swatch-line" style="background:#9d4edd"></span>Crowdsourced jam</div>
@@ -511,10 +511,18 @@ function currentTheme() {
   return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
 }
 
+// CARTO's raster basemap CDN started requiring a key 2026-08 — free tier,
+// no approval queue, 5M tile requests/month (this app is nowhere close).
+// The key is meant for exactly this kind of public client-side embedding
+// (domain-scoped, not secret-scoped — every site using it exposes it the
+// same way), so it's fine committed here in plain sight. Vector basemaps
+// don't require a key yet; CARTO says they'll announce before that changes.
+const CARTO_API_KEY = 'cb1_2fyp_1_fe29281e96d0b50c4d0de2f2';
+
 let basemapLayer = null;
 function applyBasemap(theme) {
   if (basemapLayer) map.removeLayer(basemapLayer);
-  basemapLayer = L.tileLayer(`https://{s}.basemaps.cartocdn.com/${theme === 'dark' ? 'dark_all' : 'rastertiles/voyager'}/{z}/{x}/{y}{r}.png`, {
+  basemapLayer = L.tileLayer(`https://{s}.basemaps.cartocdn.com/${theme === 'dark' ? 'dark_all' : 'rastertiles/voyager'}/{z}/{x}/{y}{r}.png?key=${CARTO_API_KEY}`, {
     attribution: '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
     subdomains: 'abcd',
     maxZoom: 20
