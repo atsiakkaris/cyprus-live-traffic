@@ -513,10 +513,16 @@ function currentTheme() {
 
 // CARTO's raster basemap CDN started requiring a key 2026-08 — free tier,
 // no approval queue, 5M tile requests/month (this app is nowhere close).
-// The key is meant for exactly this kind of public client-side embedding
-// (domain-scoped, not secret-scoped — every site using it exposes it the
-// same way), so it's fine committed here in plain sight. Vector basemaps
-// don't require a key yet; CARTO says they'll announce before that changes.
+// Necessarily exposed here, not deliberately safe-to-expose: raster tiles
+// only work as a direct browser tile-layer request, so the key has to reach
+// the browser no matter how it's shipped — unlike e.g. Mapbox's public/
+// secret token split, CARTO's docs don't describe this key as engineered
+// for client-side use, just don't offer another way to use the product.
+// Real fix if this ever matters (quota drained by a scraped key) is proxying
+// tile requests through this Worker with the key as a server-side secret,
+// same pattern as REFRESH_KEY — parked, not worth the complexity yet at this
+// app's traffic. Vector basemaps don't require a key yet; CARTO says they'll
+// announce before that changes.
 const CARTO_API_KEY = 'cb1_2fyp_1_fe29281e96d0b50c4d0de2f2';
 
 let basemapLayer = null;
