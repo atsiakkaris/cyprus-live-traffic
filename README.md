@@ -65,15 +65,13 @@ dependency between them, by design.
   line segments: `waze_alerts` and `waze_traffic`, both under
   `https://fixcyprus.cy/gnosis/open/api/nap/datasets/`.
 
-Known issue (as of 2026-08-26): the live feed's `measurement_timestamp`
-still lags well behind real time — currently stuck around
-`2026-08-21T10:01:00Z`, about 5 days stale — rather than being frozen at one
-exact value forever as first observed; see notes in the
-`traffic-control-room` project. Building ahead on the assumption this gets
-fixed upstream. The app surfaces this directly via a "Data outdated since
-..." note, separate from the Worker's own poll-freshness indicator, so
-staleness in the upstream feed itself is never silently hidden behind a
-healthy-looking poll.
+Previously known issue: the live feed's `measurement_timestamp` lagged well
+behind real time (stuck ~5 days stale as of 2026-08-26). Resolved upstream
+as of 2026-08-28 — `common_measurement_timestamp` now tracks within a few
+minutes of `generated_at`. The app still surfaces a "Data outdated since
+..." note whenever this recurs, separate from the Worker's own
+poll-freshness indicator, so staleness in the upstream feed itself is never
+silently hidden behind a healthy-looking poll.
 
 ## Running the poller
 

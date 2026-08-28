@@ -340,19 +340,131 @@ const MIN_HEALTHY_PATH_COUNT = 50;
 // perfectly good one. This ratio is the check that actually looks at the
 // live feed.
 //
-// Healthy runs sit at 97-100% matched (worst recorded: 419/431 = 97.2%), so
-// 0.8 keeps real headroom below normal while refusing anything badly
-// degraded. Being deliberately ratcheted up as confidence grows — the
-// tradeoff is that a partial upstream degradation now freezes the app on the
-// last good snapshot rather than publishing a half-empty map, which is the
-// safer of the two failure modes but does mean less tolerance for a bad day.
-const MIN_HEALTHY_LIVE_RATIO = 0.8;
+// Measured against 72 days / 416 runs of the ITS monitor's own status history
+// (traffic-control-room's results/history.db, 2026-06-12..08-28): the live
+// ratio ran min 0.801, median 0.830, max 0.872 — it never once reached 0.88.
+// An earlier note here claimed "healthy runs sit at 97-100%"; that was an
+// artefact of the same -1 counting bug fixed in matched_live_count below, and
+// the plan it justified (ratcheting this floor *up*) was backwards. At 0.85
+// this check would have rejected 81% of all runs; at 0.90, 100% of them.
+//
+// The ceiling is structural, not a feed fault: ~66 of the paths are
+// permanently dead sensors (never once reporting in 72 days), so the ratio
+// simply cannot approach 1.0. Excluding those, live runs sit at 0.895-0.964 —
+// which is the better metric to move to eventually, rather than tuning a
+// global floor against a denominator that's ~15% dead by construction.
+//
+// 0.80 sat about one point under that observed floor, which bought almost no
+// margin before a normal-but-poor day started rejecting snapshots — and a
+// rejected snapshot now also stalls free-flow baseline learning (see
+// storeIfHealthy). Lowered to 0.75 on 2026-08-28 for real headroom: still far
+// below anything seen in 72 days of history, so a genuinely broken feed is
+// still caught, but an ordinary bad day no longer freezes the app.
+const MIN_HEALTHY_LIVE_RATIO = 0.75;
 
 // Re-enabled now that geometry is cached (see loadGeometry below) instead of
 // re-parsed every tick — that was the heaviest chunk of the CPU budget that
 // caused the exceededCpu failures. If those come back, this is the first
 // thing to flip off again.
 const FETCH_EVENTS = true;
+
+// --- Free-flow baselines ---------------------------------------------------
+//
+// Absolute speed thresholds mislead: 50 km/h is severe congestion on a
+// motorway and completely normal on an urban street. What matters is speed
+// relative to how *this* road behaves when it's flowing freely.
+//
+// Classifying roads by type was the obvious approach and doesn't work here —
+// 377 of ~397 paths are named as sensor-node pairs ("1004->1008"), so there's
+// no road name to match on, and while length correlates with road class
+// (>8km paths run at a ~102 km/h median, urban ones ~28), the 3-8km band is
+// genuinely mixed: Kiprianou is 5.8km of urban arterial that a length rule
+// would call motorway and then paint permanently red.
+//
+// So instead each path learns its own free-flow speed from what it actually
+// observes. No classification, no manual table to maintain, and it adapts on
+// its own if a road changes.
+const BASELINE_KEY = "baselines";
+
+// Tracked as a running 95th percentile rather than a max: a max is set
+// forever by a single spurious reading (the feed does emit implausible
+// values — 0.1 km/h on a 19km motorway path), whereas a percentile needs
+// sustained evidence to move.
+//
+// Estimated by stochastic approximation — one add per sample, no history
+// array to store or sort. Each sample nudges the estimate up by
+// STEP*P if it's above and down by STEP*(1-P) if below; that 19:1 asymmetry
+// is what makes it settle at the 95th percentile. Cost is O(1) per path and
+// two numbers of storage, which matters on a CPU budget this tight.
+//
+// Simulated against synthetic motorway/arterial/side-street traffic before
+// committing: lands within ~1 km/h of the true p95, reaches 5% of it inside
+// 40 samples, and a single spurious reading (the 116 km/h kind) moves it by
+// at most +0.475.
+//
+// The same asymmetry that buys that outlier resistance makes it slow in the
+// other direction: a road that *permanently* slows from 110 to 70 takes
+// roughly five days to follow it down (0.025 km/h per sample). That's the
+// intended trade — permanent slowdowns are rare, bogus spikes are not — but
+// it does mean a genuine long-term change shows up as "slower than usual"
+// for several days before the baseline catches up.
+const BASELINE_TARGET_P = 0.95;
+const BASELINE_STEP_KMH = 0.5;
+
+// Withheld from the snapshot until the estimate has seen this many samples,
+// so the app falls back to absolute thresholds rather than colouring roads
+// against a baseline that's still climbing out of wherever it was seeded.
+// 288 = a full 24h at one sample per 5-min tick, so every path has seen a
+// complete daily cycle — its own night-time free-flow as well as its peaks —
+// before it's allowed to judge anything. Counted per path in actual readings,
+// not elapsed time: a path whose sensor drops out for an hour simply takes
+// correspondingly longer to qualify.
+const MIN_BASELINE_SAMPLES = 288;
+
+async function readBaselines(env) {
+  const raw = await env.TRAFFIC_KV.get(BASELINE_KEY);
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    // Corrupt value shouldn't take the whole tick down — relearning from
+    // scratch costs a day of context, a thrown error costs the snapshot.
+    console.error("Baselines unparseable — starting over");
+    return {};
+  }
+}
+
+// Returns a fresh object keyed only by paths in the current geometry, which
+// is what keeps this from growing without bound as the upstream road network
+// changes over the years (an earlier review caught the same class of bug in
+// the service worker's tile cache).
+function updateBaselines(prev, paths) {
+  const next = {};
+  for (const p of paths) {
+    const old = prev[p.id];
+    // A dead sensor (-1) or missing reading is not evidence about the road,
+    // so carry the existing estimate forward untouched rather than letting
+    // an outage drag every baseline toward zero.
+    if (p.speed_kmh == null || p.speed_kmh < 0) {
+      if (old) next[p.id] = old;
+      continue;
+    }
+    if (!old) {
+      next[p.id] = [p.speed_kmh, 1];
+      continue;
+    }
+    const [q, n] = old;
+    const step = p.speed_kmh > q
+      ? BASELINE_STEP_KMH * BASELINE_TARGET_P
+      : -BASELINE_STEP_KMH * (1 - BASELINE_TARGET_P);
+    // Two decimals, not one: the downward step is only 0.025 km/h, so
+    // rounding to 1dp snapped every decrease straight back to where it
+    // started and the estimate could only ever ratchet upward — a baseline
+    // that silently never adapts down. 2dp is still enough to keep float
+    // drift from growing the stored JSON with 17-digit values.
+    next[p.id] = [Math.round((q + step) * 100) / 100, n + 1];
+  }
+  return next;
+}
 
 // Road geometry (shape of each path) essentially never changes tick to tick
 // — re-fetching and re-parsing it every 5 min was the single heaviest chunk
@@ -388,13 +500,18 @@ async function loadGeometry(env) {
   return fetchAndCacheGeometry(env);
 }
 
+// Returns the snapshot plus the updated baselines rather than writing the
+// latter itself: baselines must only be persisted alongside a snapshot that
+// passes the health checks, so that a broken upstream feed can't quietly
+// teach every road a wrong idea of normal. storeIfHealthy owns both writes.
 async function buildSnapshot(env, { refreshGeometry = false } = {}) {
-  const [geometry, liveText, alertsRaw, jams, situations] = await Promise.all([
+  const [geometry, liveText, alertsRaw, jams, situations, prevBaselines] = await Promise.all([
     refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
     fetchText(LIVE_URL),
     FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication") : Promise.resolve([]),
+    readBaselines(env),
   ]);
 
   const live = parseLive(liveText);
@@ -406,10 +523,23 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     paths.push({ id: pid, name: geo.name, coords: geo.coords, ...liveData });
   }
 
-  return {
+  const baselines = updateBaselines(prevBaselines, paths);
+  for (const p of paths) {
+    const b = baselines[p.id];
+    // Null until warmed up — the app treats that as "no baseline, use the
+    // absolute thresholds" rather than guessing from a half-learned value.
+    p.free_flow_kmh = (b && b[1] >= MIN_BASELINE_SAMPLES) ? b[0] : null;
+  }
+
+  const snapshot = {
     generated_at: new Date().toISOString(),
     path_count: paths.length,
-    matched_live_count: paths.filter((p) => p.speed_kmh != null).length,
+    // -1 is the feed's sentinel for a malfunctioning sensor — the app
+    // renders it identically to null (grey, "No data", see colorFor in
+    // preview/index.html), so it must not count as "matched" here either.
+    // Previously only null was excluded, letting dead-sensor paths inflate
+    // this ratio above what the app actually shows as having data.
+    matched_live_count: paths.filter((p) => p.speed_kmh != null && p.speed_kmh >= 0).length,
     // Mode (not max) across all paths' own measured_at — the timestamp most
     // paths share represents the feed's bulk state, resistant to a handful
     // of outlier paths in either direction (one stray fresh path masking a
@@ -418,12 +548,18 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     // poll succeeded, not that the underlying data actually moved — this is
     // the field that catches a frozen-but-still-200-OK upstream feed.
     common_measurement_timestamp: modeMeasuredAt(paths),
+    // How many paths have a warmed-up baseline — lets the app (and a glance
+    // at /refresh) tell "still learning" apart from "learned, and this road
+    // genuinely has no data".
+    baseline_ready_count: paths.filter((p) => p.free_flow_kmh != null).length,
     paths,
     alerts,
     road_closures,
     jams,
     situations,
   };
+
+  return { snapshot, baselines };
 }
 
 function modeMeasuredAt(paths) {
@@ -503,13 +639,18 @@ function unhealthyReason(snapshot) {
   return null;
 }
 
-async function storeIfHealthy(env, snapshot) {
+async function storeIfHealthy(env, snapshot, baselines) {
   const reason = unhealthyReason(snapshot);
   if (reason) {
     console.error(`Refusing to store suspicious snapshot: ${reason} (upstream likely broken)`);
     return reason;
   }
-  await env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot));
+  await Promise.all([
+    env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot)),
+    // Gated on the same health check as the snapshot itself: a degraded feed
+    // must not get a vote on what each road's normal speed looks like.
+    env.TRAFFIC_KV.put(BASELINE_KEY, JSON.stringify(baselines)),
+  ]);
   return null;
 }
 
@@ -520,8 +661,8 @@ const GEOMETRY_CRON = "0 */6 * * *";
 
 export default {
   async scheduled(event, env) {
-    const snapshot = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
-    await storeIfHealthy(env, snapshot);
+    const { snapshot, baselines } = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
+    await storeIfHealthy(env, snapshot, baselines);
   },
 
   async fetch(request, env) {
@@ -536,8 +677,8 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
       console.log(`GET /refresh from ${describeCaller(request)}`);
-      const snapshot = await buildSnapshot(env, { refreshGeometry: true });
-      const reason = await storeIfHealthy(env, snapshot);
+      const { snapshot, baselines } = await buildSnapshot(env, { refreshGeometry: true });
+      const reason = await storeIfHealthy(env, snapshot, baselines);
       if (reason) {
         return new Response(
           JSON.stringify({ error: `Upstream returned a suspiciously broken feed (${reason}) — last good snapshot kept.`, ...snapshot }),

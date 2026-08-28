@@ -168,13 +168,14 @@
     bottom: calc(env(safe-area-inset-bottom, 0px) + 28px);
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
-  .zoom-btn, .locate-btn {
+  .zoom-btn, .locate-btn, .share-btn {
     width: 46px; height: 46px; border-radius: 50%;
     background: var(--panel-bg); border: none;
     box-shadow: 0 2px 10px rgba(0,0,0,.25);
     display: flex; align-items: center; justify-content: center;
   }
-  .zoom-btn:active, .locate-btn:active { background: var(--locate-active-bg); }
+  .zoom-btn:active, .locate-btn:active, .share-btn:active { background: var(--locate-active-bg); }
+  .share-btn svg { width: 22px; height: 22px; stroke: var(--locate-stroke); }
   .zoom-btn { font-size: 22px; line-height: 1; color: var(--locate-stroke); }
   .zoom-btn.disabled { opacity: 0.35; pointer-events: none; }
   .locate-btn svg { width: 24px; height: 24px; stroke: var(--locate-stroke); }
@@ -298,6 +299,10 @@
   .sheet-title { font-size: 18px; font-weight: 700; }
   .sheet-sub { font-size: 15px; color: var(--sheet-sub-color); margin-top: 4px; }
   .sheet-meta { font-size: 13px; color: var(--sheet-unit-color); margin-top: 8px; }
+  /* Sits between the big speed number and the travel-time line, and carries
+     more weight than .sheet-meta — it's the line that tells you whether the
+     number above is good or bad, which is the actual question. */
+  .sheet-context { font-size: 14px; font-weight: 600; margin-top: 6px; }
   .sheet-source { font-size: 11px; color: var(--sheet-unit-color); margin-top: 10px; opacity: 0.7; }
 
   .loading-overlay {
@@ -374,6 +379,14 @@
 </div>
 
 <div class="map-controls">
+  <button class="share-btn" id="shareBtn" aria-label="Share this view">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#1a1a2e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="18" cy="5" r="3"></circle>
+      <circle cx="6" cy="12" r="3"></circle>
+      <circle cx="18" cy="19" r="3"></circle>
+      <path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"></path>
+    </svg>
+  </button>
   <button class="zoom-btn" id="zoomInBtn" aria-label="Zoom in">+</button>
   <button class="zoom-btn" id="zoomOutBtn" aria-label="Zoom out">&minus;</button>
   <button class="locate-btn" id="locateBtn" aria-label="Find my location">
@@ -408,7 +421,7 @@ function haptic(ms = 10) {
 // on CSS :active, which mobile browsers can delay while disambiguating a
 // tap from the start of a scroll — applied generically here rather than
 // wiring each button's markup by hand.
-document.querySelectorAll('.filter-toggle, .zoom-btn, .locate-btn, .cvd-toggle, .theme-toggle, .sheet-close').forEach(el => {
+document.querySelectorAll('.filter-toggle, .zoom-btn, .locate-btn, .share-btn, .cvd-toggle, .theme-toggle, .sheet-close').forEach(el => {
   el.classList.add('pressable');
   el.addEventListener('touchstart', () => el.classList.add('pressed'), { passive: true });
   ['touchend', 'touchcancel'].forEach(evt => el.addEventListener(evt, () => el.classList.remove('pressed')));
@@ -430,11 +443,57 @@ function loadSavedView() {
 }
 const savedView = loadSavedView();
 
+// Shared/deep-linked view, e.g.
+//   #map=12/34.9182/33.6221&filters=closures,jams&cvd=1
+// Kept in the hash rather than the query string for two reasons: it never
+// reaches the server or the Worker's logs, and changing it doesn't look like
+// a different URL to the service worker's app-shell cache.
+//
+// zoom/lat/lng in one slash-separated value follows the same convention
+// OpenStreetMap uses, so the shape is familiar and hand-editable.
+const SHAREABLE_FILTERS = ['closures', 'hazards', 'jams', 'works'];
+function parseHashView() {
+  if (!location.hash || location.hash.length < 2) return null;
+  const params = new URLSearchParams(location.hash.slice(1));
+  const result = {};
+
+  const map = params.get('map');
+  if (map) {
+    const [zoom, lat, lng] = map.split('/').map(Number);
+    // Same Number.isFinite guard as loadSavedView, and for the same reason —
+    // a hand-mangled link must degrade to "ignore the view" rather than
+    // feeding NaN into setView and breaking the map outright. Ranges are
+    // checked too since a shared link is untrusted input in a way
+    // localStorage isn't.
+    if (Number.isFinite(lat) && Number.isFinite(lng) && Number.isFinite(zoom) &&
+        lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180 && zoom >= 0 && zoom <= 20) {
+      result.lat = lat; result.lng = lng; result.zoom = zoom;
+    }
+  }
+
+  // Filtered against the known set rather than trusted as-is, so an unknown
+  // or misspelled name in a shared link can't index into filterLayers and
+  // throw during startup.
+  const filters = params.get('filters');
+  if (filters) {
+    result.filters = filters.split(',').filter(f => SHAREABLE_FILTERS.includes(f));
+  }
+
+  if (params.get('cvd') === '1') result.cvd = true;
+  return Object.keys(result).length ? result : null;
+}
+const hashView = parseHashView();
+
+// A shared link wins over the visitor's own last-viewed position: following
+// someone's link and landing somewhere else entirely would make the link
+// look broken. The saved view stays the fallback for an ordinary open.
+const initialView = (hashView && hashView.lat != null) ? hashView : savedView;
+
 // Canvas instead of the SVG default: with 429 roads x 2 lines each plus jam
 // segments, canvas rendering keeps pan/zoom noticeably smoother on phones.
 const map = L.map('map', { zoomControl: false, tap: true, renderer: L.canvas() }).setView(
-  savedView ? [savedView.lat, savedView.lng] : [35.05, 33.15],
-  savedView ? savedView.zoom : 9
+  initialView ? [initialView.lat, initialView.lng] : [35.05, 33.15],
+  initialView ? initialView.zoom : 9
 );
 map.on('moveend', () => {
   const c = map.getCenter();
@@ -552,9 +611,27 @@ const PALETTES = {
 };
 let colorblindMode = false;
 
-function colorFor(speed) {
+// Fractions of a road's own free-flow speed, not absolute km/h. 50 km/h is
+// severe congestion on a motorway that normally runs at 110 (0.45) and
+// completely normal on a street that tops out at 55 (0.91) — the same
+// number, opposite meanings, which is exactly what the absolute thresholds
+// below get wrong.
+const RELATIVE_FAST = 0.75;
+const RELATIVE_MODERATE = 0.5;
+
+// freeFlow is null until the Worker's estimate for that path has enough
+// samples to be trustworthy (see MIN_BASELINE_SAMPLES in worker.js), and
+// stays null for roads whose sensor never reports. Both fall back to the
+// absolute scale, which is what the legend describes in that state.
+function colorFor(speed, freeFlow) {
   const p = colorblindMode ? PALETTES.cvd : PALETTES.normal;
   if (speed == null || speed < 0) return '#95a5a6'; // -1 = malfunctioning sensor, same in both palettes
+  if (freeFlow != null && freeFlow > 0) {
+    const ratio = speed / freeFlow;
+    if (ratio >= RELATIVE_FAST) return p.fast;
+    if (ratio >= RELATIVE_MODERATE) return p.moderate;
+    return p.slow;
+  }
   if (speed > 60) return p.fast;
   if (speed >= 30) return p.moderate;
   return p.slow;
@@ -724,10 +801,31 @@ cvdToggleBtn.addEventListener('click', (e) => {
   // entry.color too — that's the animateColor baseline in loadData above, so
   // the next refresh doesn't animate back from the pre-toggle color.
   for (const entry of layersById.values()) {
-    entry.color = colorFor(entry.hit.speedKmh);
+    entry.color = colorFor(entry.hit.speedKmh, entry.hit.freeFlowKmh);
     setColorNow(entry.visible, entry.color);
   }
 });
+
+// Applied here, after both the filter chips and the palette toggle exist,
+// rather than at parse time up top — the layers and buttons this has to
+// touch aren't defined yet at that point. Roads haven't been drawn either,
+// so setting colorblindMode is enough on its own: the first colorFor call
+// during loadData already picks up the shared palette, with nothing to
+// recolor after the fact.
+if (hashView) {
+  if (hashView.filters) {
+    for (const key of hashView.filters) {
+      filterVisible[key] = true;
+      map.addLayer(filterLayers[key]);
+      document.querySelector(`.filter-toggle[data-filter="${key}"]`).classList.add('active');
+    }
+  }
+  if (hashView.cvd) {
+    colorblindMode = true;
+    cvdToggleBtn.classList.add('active');
+    applyPaletteToLegend();
+  }
+}
 
 const sheet = document.getElementById('sheet');
 const backdrop = document.getElementById('backdrop');
@@ -773,10 +871,24 @@ function formatTravelTime(seconds) {
   return seconds < 60 ? `${Math.round(seconds)} sec` : `${Math.round(seconds / 60)} min`;
 }
 
-function openSheet(speed, travelTimeS) {
+// The number alone doesn't say whether it's good or bad — 50 km/h means
+// opposite things on a motorway and a side street. Where a learned free-flow
+// speed exists, say so in words rather than making the reader infer it from
+// the line's colour.
+function describeRelativeSpeed(speed, freeFlow) {
+  if (freeFlow == null || freeFlow <= 0) return null;
+  const ratio = speed / freeFlow;
+  const label = ratio >= RELATIVE_FAST ? 'Flowing normally'
+    : ratio >= RELATIVE_MODERATE ? 'Slower than usual'
+    : 'Much slower than usual';
+  return `${label} · usually ~${Math.round(freeFlow)} km/h here`;
+}
+
+function openSheet(speed, travelTimeS, freeFlowKmh) {
   const travel = formatTravelTime(travelTimeS);
+  const context = (speed != null && speed >= 0) ? describeRelativeSpeed(speed, freeFlowKmh) : null;
   sheetBody.innerHTML = (speed != null && speed >= 0)
-    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>${travel ? `<div class="sheet-meta">~${travel} travel time</div>` : ''}`
+    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>${context ? `<div class="sheet-context">${escapeHtml(context)}</div>` : ''}${travel ? `<div class="sheet-meta">~${travel} travel time</div>` : ''}`
     : `<div class="sheet-nodata">No live data for this road</div>`;
   showSheet();
 }
@@ -954,6 +1066,77 @@ function updateZoomButtons() {
 map.on('zoomend', updateZoomButtons);
 updateZoomButtons();
 
+// Builds the link that parseHashView reads back. Coordinates are rounded to
+// 5 decimals (~1m) — enough to pin a junction, while keeping the link short
+// enough to paste into a message without it wrapping over several lines.
+function buildShareUrl() {
+  const c = map.getCenter();
+  // Assembled by hand rather than via URLSearchParams.toString(), which
+  // percent-encodes the separators into `%2F` and `%2C` — still correct, and
+  // URLSearchParams decodes them again on the way back in, but it turns a
+  // glanceable link into a wall of escapes in the one place users actually
+  // see the URL. Both characters are legal unescaped in a fragment.
+  const parts = [`map=${map.getZoom()}/${c.lat.toFixed(5)}/${c.lng.toFixed(5)}`];
+  const on = SHAREABLE_FILTERS.filter(key => filterVisible[key]);
+  if (on.length) parts.push(`filters=${on.join(',')}`);
+  if (colorblindMode) parts.push('cvd=1');
+  // Theme is deliberately not shared: it's a property of how the person
+  // reading likes their screen, not of the traffic situation being pointed
+  // at. Filters and palette describe *what* the link is showing; theme
+  // doesn't, and forcing it would override the recipient's own preference.
+  return `${location.origin}${location.pathname}#${parts.join('&')}`;
+}
+
+// navigator.clipboard is a permissioned API and genuinely gets denied —
+// NotAllowedError in an embedded/iframed context, older Firefox, or a
+// hardened profile. The deprecated execCommand path still works in exactly
+// those cases, so it's the difference between the share button doing
+// nothing and doing its job. Off-screen rather than display:none, because
+// a hidden textarea can't be selected.
+function legacyCopy(text) {
+  const el = document.createElement('textarea');
+  el.value = text;
+  el.setAttribute('readonly', '');
+  el.style.cssText = 'position:absolute;left:-9999px;top:0';
+  document.body.appendChild(el);
+  el.select();
+  try {
+    return document.execCommand('copy');
+  } catch (e) {
+    return false;
+  } finally {
+    document.body.removeChild(el);
+  }
+}
+
+const shareBtn = document.getElementById('shareBtn');
+shareBtn.addEventListener('click', async (e) => {
+  e.stopPropagation();
+  haptic();
+  const url = buildShareUrl();
+  // Update the address bar too, so the link is also grabbable the ordinary
+  // way. replaceState rather than assigning location.hash — the latter adds
+  // a history entry, turning the phone's back button into an undo of every
+  // share tap instead of a way out of the app.
+  history.replaceState(null, '', url);
+  try {
+    // The native sheet on mobile (where this app is aimed) puts the link
+    // straight into whatever messaging app the person actually uses;
+    // clipboard is the desktop fallback.
+    if (navigator.share) {
+      await navigator.share({ title: 'Cyprus Live Traffic', url });
+    } else {
+      await navigator.clipboard.writeText(url);
+      showToast('Link copied');
+    }
+  } catch (err) {
+    // AbortError just means the share sheet was dismissed — a deliberate
+    // "never mind", not a failure worth reporting back to the user.
+    if (err && err.name === 'AbortError') return;
+    showToast(legacyCopy(url) ? 'Link copied' : 'Could not copy link');
+  }
+});
+
 let userMarker = null;
 const locateBtn = document.getElementById('locateBtn');
 
@@ -990,16 +1173,21 @@ map.on('locationerror', (e) => {
     e.code === 1 ? 'Location permission denied' : 'Could not get your location'
   );
   // Only zoom out to fit every road if there was nowhere better to fall
-  // back to — a saved view (see above) already put the map somewhere more
-  // useful than the whole island before geolocation was even attempted.
-  if (!savedView && pathBounds) map.fitBounds(pathBounds, { padding: [20, 20] });
+  // back to — a shared link or saved view (see above) already put the map
+  // somewhere more useful than the whole island before geolocation was even
+  // attempted. Checking initialView rather than savedView matters for the
+  // shared-link case: fitting the whole island here would throw away the
+  // exact spot the link was pointing at.
+  if (!initialView && pathBounds) map.fitBounds(pathBounds, { padding: [20, 20] });
 });
 
 // Try to center on the user as soon as the app opens, no tap required —
 // except on local file:// testing, where the page auto-reloads every few
 // minutes and re-centering/re-prompting for location each time would be
-// disruptive. The button is still there to trigger it manually there.
-if (location.protocol !== 'file:') {
+// disruptive, and except when following a shared link, where snapping to
+// the visitor's own position would defeat the entire point of the link.
+// The button is still there to trigger it manually in both cases.
+if (location.protocol !== 'file:' && !(hashView && hashView.lat != null)) {
   doLocate();
 }
 
@@ -1090,7 +1278,7 @@ function loadData() {
         seenIds.add(p.id);
         const latlngs = p.coords.map(c => [c[0], c[1]]);
         let entry = layersById.get(p.id);
-        const newColor = colorFor(p.speed_kmh);
+        const newColor = colorFor(p.speed_kmh, p.free_flow_kmh);
         if (entry) {
           // Update in place — re-drawing 431 fresh polylines every refresh
           // would flicker and drop whatever the user was mid-interaction
@@ -1099,6 +1287,7 @@ function loadData() {
           entry.color = newColor;
           entry.hit.speedKmh = p.speed_kmh;
           entry.hit.travelTimeS = p.travel_time_s;
+          entry.hit.freeFlowKmh = p.free_flow_kmh;
         } else {
           // Two lines per road: a thin visible one (what you see) and a much
           // wider invisible one on top of it (what actually catches taps) —
@@ -1113,10 +1302,11 @@ function loadData() {
           }).addTo(map);
           hit.speedKmh = p.speed_kmh;
           hit.travelTimeS = p.travel_time_s;
+          hit.freeFlowKmh = p.free_flow_kmh;
           hit.on('click', (e) => {
             L.DomEvent.stopPropagation(e); // don't let this bubble to the map's own click-to-close handler
             haptic();
-            openSheet(hit.speedKmh, hit.travelTimeS);
+            openSheet(hit.speedKmh, hit.travelTimeS, hit.freeFlowKmh);
           });
           entry = { visible, hit, color: newColor };
           layersById.set(p.id, entry);
