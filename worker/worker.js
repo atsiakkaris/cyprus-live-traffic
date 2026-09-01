@@ -421,6 +421,55 @@ const BASELINE_STEP_KMH = 0.5;
 // correspondingly longer to qualify.
 const MIN_BASELINE_SAMPLES = 288;
 
+// --- Per-path staleness -----------------------------------------------------
+//
+// The feed's own per-path measurement_timestamp is useless for this: every
+// path shares one bulk value (see modeMeasuredAt) that advances every 5-min
+// tick regardless of whether that path's actual reading changed, so a sensor
+// that's been silently stuck for hours still carries a "fresh" timestamp.
+// The only real signal is whether the *value itself* is moving — if
+// speed_kmh and travel_time_s come back byte-identical tick after tick, the
+// upstream sensor isn't producing new data, it's re-serving its last one.
+const STALE_KEY = "staleness";
+
+// How many consecutive identical readings before a path is flagged stale.
+// 6 ticks = 30 minutes: long enough that a genuinely quiet free-flow road
+// (which can legitimately report the same rounded speed a few ticks running)
+// won't trip it, short enough to protect users well before the 4h+ cases
+// this was built to catch (see the 2026-09-01 stuck-corridor investigation
+// — those sat unchanged for hours before anyone noticed).
+const STALE_TICKS = 6;
+
+async function readStaleness(env) {
+  const raw = await env.TRAFFIC_KV.get(STALE_KEY);
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    console.error("Staleness state unparseable — starting over");
+    return {};
+  }
+}
+
+// Same shape of function as updateBaselines and for the same reason: returns
+// a fresh object keyed only by paths in the current geometry so a removed
+// path's tracking state doesn't linger in KV forever.
+function updateStaleness(prev, paths, now) {
+  const next = {};
+  for (const p of paths) {
+    // No reading (dead sensor or missing) isn't evidence of staleness — it's
+    // already rendered distinctly as "No data" (see colorFor). Drop tracking
+    // rather than counting toward or resetting a streak that means something
+    // different once real data resumes.
+    if (p.speed_kmh == null || p.speed_kmh < 0) continue;
+    const old = prev[p.id];
+    const unchanged = old && old[0] === p.speed_kmh && old[1] === p.travel_time_s;
+    next[p.id] = unchanged
+      ? [p.speed_kmh, p.travel_time_s, old[2], old[3] + 1]
+      : [p.speed_kmh, p.travel_time_s, now, 1];
+  }
+  return next;
+}
+
 async function readBaselines(env) {
   const raw = await env.TRAFFIC_KV.get(BASELINE_KEY);
   try {
@@ -505,13 +554,14 @@ async function loadGeometry(env) {
 // passes the health checks, so that a broken upstream feed can't quietly
 // teach every road a wrong idea of normal. storeIfHealthy owns both writes.
 async function buildSnapshot(env, { refreshGeometry = false } = {}) {
-  const [geometry, liveText, alertsRaw, jams, situations, prevBaselines] = await Promise.all([
+  const [geometry, liveText, alertsRaw, jams, situations, prevBaselines, prevStaleness] = await Promise.all([
     refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
     fetchText(LIVE_URL),
     FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication") : Promise.resolve([]),
     readBaselines(env),
+    readStaleness(env),
   ]);
 
   const live = parseLive(liveText);
@@ -529,6 +579,13 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     // Null until warmed up — the app treats that as "no baseline, use the
     // absolute thresholds" rather than guessing from a half-learned value.
     p.free_flow_kmh = (b && b[1] >= MIN_BASELINE_SAMPLES) ? b[0] : null;
+  }
+
+  const now = new Date().toISOString();
+  const staleness = updateStaleness(prevStaleness, paths, now);
+  for (const p of paths) {
+    const s = staleness[p.id];
+    p.stale = !!(s && s[3] >= STALE_TICKS);
   }
 
   const snapshot = {
@@ -552,6 +609,9 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     // at /refresh) tell "still learning" apart from "learned, and this road
     // genuinely has no data".
     baseline_ready_count: paths.filter((p) => p.free_flow_kmh != null).length,
+    // How many paths are currently flagged stale (see p.stale/updateStaleness
+    // above) — a quick health signal, same spirit as baseline_ready_count.
+    stale_count: paths.filter((p) => p.stale).length,
     paths,
     alerts,
     road_closures,
@@ -559,7 +619,7 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     situations,
   };
 
-  return { snapshot, baselines };
+  return { snapshot, baselines, staleness };
 }
 
 function modeMeasuredAt(paths) {
@@ -639,7 +699,7 @@ function unhealthyReason(snapshot) {
   return null;
 }
 
-async function storeIfHealthy(env, snapshot, baselines) {
+async function storeIfHealthy(env, snapshot, baselines, staleness) {
   const reason = unhealthyReason(snapshot);
   if (reason) {
     console.error(`Refusing to store suspicious snapshot: ${reason} (upstream likely broken)`);
@@ -650,6 +710,10 @@ async function storeIfHealthy(env, snapshot, baselines) {
     // Gated on the same health check as the snapshot itself: a degraded feed
     // must not get a vote on what each road's normal speed looks like.
     env.TRAFFIC_KV.put(BASELINE_KEY, JSON.stringify(baselines)),
+    // Same gating logic, and for the same reason as above — a rejected
+    // snapshot's readings shouldn't reset or advance any path's unchanged
+    // streak either.
+    env.TRAFFIC_KV.put(STALE_KEY, JSON.stringify(staleness)),
   ]);
   return null;
 }
@@ -661,8 +725,8 @@ const GEOMETRY_CRON = "0 */6 * * *";
 
 export default {
   async scheduled(event, env) {
-    const { snapshot, baselines } = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
-    await storeIfHealthy(env, snapshot, baselines);
+    const { snapshot, baselines, staleness } = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
+    await storeIfHealthy(env, snapshot, baselines, staleness);
   },
 
   async fetch(request, env) {
@@ -677,8 +741,8 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
       console.log(`GET /refresh from ${describeCaller(request)}`);
-      const { snapshot, baselines } = await buildSnapshot(env, { refreshGeometry: true });
-      const reason = await storeIfHealthy(env, snapshot, baselines);
+      const { snapshot, baselines, staleness } = await buildSnapshot(env, { refreshGeometry: true });
+      const reason = await storeIfHealthy(env, snapshot, baselines, staleness);
       if (reason) {
         return new Response(
           JSON.stringify({ error: `Upstream returned a suspiciously broken feed (${reason}) — last good snapshot kept.`, ...snapshot }),
