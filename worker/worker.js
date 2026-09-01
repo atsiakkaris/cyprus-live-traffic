@@ -432,14 +432,6 @@ const MIN_BASELINE_SAMPLES = 288;
 // upstream sensor isn't producing new data, it's re-serving its last one.
 const STALE_KEY = "staleness";
 
-// How many consecutive identical readings before a path is flagged stale.
-// 6 ticks = 30 minutes: long enough that a genuinely quiet free-flow road
-// (which can legitimately report the same rounded speed a few ticks running)
-// won't trip it, short enough to protect users well before the 4h+ cases
-// this was built to catch (see the 2026-09-01 stuck-corridor investigation
-// — those sat unchanged for hours before anyone noticed).
-const STALE_TICKS = 6;
-
 async function readStaleness(env) {
   const raw = await env.TRAFFIC_KV.get(STALE_KEY);
   try {
@@ -581,11 +573,19 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     p.free_flow_kmh = (b && b[1] >= MIN_BASELINE_SAMPLES) ? b[0] : null;
   }
 
+  // Tracking runs every tick regardless (see updateStaleness above), but as
+  // of 2026-09-01 nothing is derived from it yet: a first attempt at a
+  // 30-min/6-tick "stale" threshold flagged 247 of ~397 paths within an
+  // hour of deploy, which means most roads legitimately go that long
+  // between real value changes — the assumption behind the threshold was
+  // wrong, not just its number. Exposing the raw streak length instead of a
+  // guessed-at boolean, so a few days of real /latest.json polls can show
+  // the actual distribution before anything picks a threshold again.
   const now = new Date().toISOString();
   const staleness = updateStaleness(prevStaleness, paths, now);
   for (const p of paths) {
     const s = staleness[p.id];
-    p.stale = !!(s && s[3] >= STALE_TICKS);
+    p.unchanged_ticks = s ? s[3] : 0;
   }
 
   const snapshot = {
@@ -609,9 +609,6 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     // at /refresh) tell "still learning" apart from "learned, and this road
     // genuinely has no data".
     baseline_ready_count: paths.filter((p) => p.free_flow_kmh != null).length,
-    // How many paths are currently flagged stale (see p.stale/updateStaleness
-    // above) — a quick health signal, same spirit as baseline_ready_count.
-    stale_count: paths.filter((p) => p.stale).length,
     paths,
     alerts,
     road_closures,

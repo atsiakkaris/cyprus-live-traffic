@@ -304,7 +304,6 @@
      number above is good or bad, which is the actual question. */
   .sheet-context { font-size: 14px; font-weight: 600; margin-top: 6px; }
   .sheet-source { font-size: 11px; color: var(--sheet-unit-color); margin-top: 10px; opacity: 0.7; }
-  .sheet-stale-note { font-size: 12px; color: var(--stale-color); margin-top: 8px; font-weight: 600; }
 
   .loading-overlay {
     position: absolute; inset: 0; z-index: 1800;
@@ -634,15 +633,6 @@ let colorblindMode = false;
 const RELATIVE_FAST = 0.75;
 const RELATIVE_MODERATE = 0.5;
 
-// A road the Worker has flagged stale (same reading served for 30+ min
-// straight — see p.stale/STALE_TICKS in worker.js) still gets its usual
-// colour, just faded — the colour is still the best guess available, but a
-// dimmed line reads as "don't fully trust this" without hiding the road or
-// forcing a fifth colour into the legend. Full-opacity roads are 0.85; grey
-// "no data" roads (see colorFor) aren't touched by this at all.
-const ROAD_OPACITY = 0.85;
-const STALE_ROAD_OPACITY = 0.35;
-
 // freeFlow is null until the Worker's estimate for that path has enough
 // samples to be trustworthy (see MIN_BASELINE_SAMPLES in worker.js), and
 // stays null for roads whose sensor never reports. Both fall back to the
@@ -908,16 +898,11 @@ function describeRelativeSpeed(speed, freeFlow) {
   return `${label} · usually ~${Math.round(freeFlow)} km/h here`;
 }
 
-function openSheet(speed, travelTimeS, freeFlowKmh, stale) {
+function openSheet(speed, travelTimeS, freeFlowKmh) {
   const travel = formatTravelTime(travelTimeS);
   const context = (speed != null && speed >= 0) ? describeRelativeSpeed(speed, freeFlowKmh) : null;
-  // Same reading the sensor's been repeating for 30+ min — told plainly
-  // rather than left for the reader to infer from the dimmed line alone,
-  // since a bottom sheet tap means they're already looking closely at this
-  // one road.
-  const staleNote = stale ? `<div class="sheet-stale-note">Reading hasn't changed in a while — may not reflect current traffic</div>` : '';
   sheetBody.innerHTML = (speed != null && speed >= 0)
-    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>${context ? `<div class="sheet-context">${escapeHtml(context)}</div>` : ''}${travel ? `<div class="sheet-meta">~${travel} travel time</div>` : ''}${staleNote}`
+    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>${context ? `<div class="sheet-context">${escapeHtml(context)}</div>` : ''}${travel ? `<div class="sheet-meta">~${travel} travel time</div>` : ''}`
     : `<div class="sheet-nodata">No live data for this road</div>`;
   showSheet();
 }
@@ -1308,25 +1293,22 @@ function loadData() {
         const latlngs = p.coords.map(c => [c[0], c[1]]);
         let entry = layersById.get(p.id);
         const newColor = colorFor(p.speed_kmh, p.free_flow_kmh);
-        const opacity = p.stale ? STALE_ROAD_OPACITY : ROAD_OPACITY;
         if (entry) {
           // Update in place — re-drawing 431 fresh polylines every refresh
           // would flicker and drop whatever the user was mid-interaction
           // with (e.g. an open bottom sheet).
           animateColor(entry.visible, entry.color, newColor);
-          entry.visible.setStyle({ opacity });
           entry.color = newColor;
           entry.hit.speedKmh = p.speed_kmh;
           entry.hit.travelTimeS = p.travel_time_s;
           entry.hit.freeFlowKmh = p.free_flow_kmh;
-          entry.hit.stale = p.stale;
         } else {
           // Two lines per road: a thin visible one (what you see) and a much
           // wider invisible one on top of it (what actually catches taps) —
           // the visible line alone is too thin a target to tap reliably,
           // especially zoomed out.
           const visible = L.polyline(latlngs, {
-            color: newColor, weight: 5, opacity,
+            color: newColor, weight: 5, opacity: 0.85,
             interactive: false
           }).addTo(map);
           const hit = L.polyline(latlngs, {
@@ -1335,11 +1317,10 @@ function loadData() {
           hit.speedKmh = p.speed_kmh;
           hit.travelTimeS = p.travel_time_s;
           hit.freeFlowKmh = p.free_flow_kmh;
-          hit.stale = p.stale;
           hit.on('click', (e) => {
             L.DomEvent.stopPropagation(e); // don't let this bubble to the map's own click-to-close handler
             haptic();
-            openSheet(hit.speedKmh, hit.travelTimeS, hit.freeFlowKmh, hit.stale);
+            openSheet(hit.speedKmh, hit.travelTimeS, hit.freeFlowKmh);
           });
           entry = { visible, hit, color: newColor };
           layersById.set(p.id, entry);
