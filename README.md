@@ -35,7 +35,7 @@ dependency between them, by design.
   relative to each road's own learned free-flow speed once the Worker has
   enough history for it, falling back to a general fast/moderate/slow scale
   otherwise (light/dark basemap follows system theme by default, with a
-  manual override toggle and a colorblind-safe palette toggle), plus
+  manual override toggle), plus
   toggleable, clustered layers for road closures, hazards/accidents,
   crowdsourced jams, and official road works — each with a mobile-style
   bottom sheet (swipe-to-dismiss) on tap, showing which feed it came from.

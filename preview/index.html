@@ -99,7 +99,11 @@
     padding: 10px 14px; border-radius: 12px;
     font-size: 13px; line-height: 1.9;
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
-    max-width: 220px;
+    max-width: 250px;
+    /* Matches the filter-row below it (4 buttons + gaps, see .filter-row)
+       so both rows' left edges line up under the same collapsed chip width
+       instead of the chip sitting narrower and inset from the icons. */
+    min-width: 200px;
   }
   .legend div { display: flex; align-items: center; }
   /* Scoped to .legend-body, not the whole .legend — it must not also catch
@@ -110,8 +114,18 @@
   .legend-header {
     display: flex; align-items: center; justify-content: space-between;
     font-weight: 600; cursor: pointer; user-select: none;
+    /* Content alone (the 26px chevron) only made this row ~26px tall — well
+       under the ~44px minimum recommended touch target on mobile. min-height
+       pads it out without changing how anything inside actually looks,
+       since align-items: center keeps everything vertically centered. */
+    min-height: 44px;
   }
-  .legend-header .chevron { transition: transform var(--dur-fast) ease; }
+  /* Sized well past the text around it — the whole header row already
+     toggles collapse on tap, but this is the part meant to read as "tap
+     here to open the menu" on a phone. Margins tuned so it sits equidistant
+     between the theme toggle and the panel's right edge, not flush against
+     either. */
+  .legend-header .chevron { font-size: 26px; line-height: 1; margin-left: 8px; margin-right: 2px; transition: transform var(--dur-fast) ease; }
   .legend.collapsed .legend-header .chevron { transform: rotate(-90deg); }
   .legend .legend-body {
     display: block; /* .legend div{display:flex} would otherwise turn this
@@ -202,7 +216,7 @@
     width: 44px; height: 44px;
     box-shadow: 0 2px 10px rgba(0,0,0,.18);
     display: flex; align-items: center; justify-content: center;
-    opacity: 0.4; transition: opacity var(--dur-fast) ease;
+    opacity: 0.65; transition: opacity var(--dur-fast) ease;
   }
   .filter-toggle.active { opacity: 1; }
 
@@ -233,8 +247,12 @@
     /* Without this, the "Data outdated since ..." line has no width limit
        and grows to fit its full text on one line — on narrower phones that
        reaches far enough right to overlap the legend panel. Capped and left
-       to wrap instead, same guard the legend box already has. */
-    max-width: 42vw;
+       to wrap instead, same guard the legend box already has.
+       Sized against the legend's own min-width (200px, see .legend) plus
+       its right margin and a small gap, not just a flat vw fraction — a
+       plain 42vw stopped being safe once the legend got a guaranteed
+       minimum footprint on the right and the two started overlapping. */
+    max-width: calc(100vw - 236px);
   }
   .freshness.stale { color: var(--stale-color); font-weight: 600; }
   /* Discreet second line — only shown when the underlying feed data itself
@@ -248,11 +266,10 @@
   /* Lives inside the legend header instead of as a fourth separate floating
      chip — it only matters when you're already looking at legend colors. */
   .legend-header-actions { display: flex; align-items: center; gap: 8px; }
-  .cvd-toggle, .theme-toggle {
+  .theme-toggle {
     background: none; border: none; padding: 4px; font-size: 14px;
-    opacity: 0.4; line-height: 1;
+    opacity: 1; line-height: 1;
   }
-  .cvd-toggle.active, .theme-toggle { opacity: 1; }
 
   .toast {
     position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 90px);
@@ -345,7 +362,6 @@
       <span>Legend</span>
       <span class="legend-header-actions">
         <button class="theme-toggle" id="themeToggle" aria-label="Toggle light/dark theme">🌙</button>
-        <button class="cvd-toggle" id="cvdToggle" aria-label="Toggle colorblind-friendly colors">🎨</button>
         <span class="chevron">▾</span>
       </span>
     </div>
@@ -421,7 +437,7 @@ function haptic(ms = 10) {
 // on CSS :active, which mobile browsers can delay while disambiguating a
 // tap from the start of a scroll — applied generically here rather than
 // wiring each button's markup by hand.
-document.querySelectorAll('.filter-toggle, .zoom-btn, .locate-btn, .share-btn, .cvd-toggle, .theme-toggle, .sheet-close').forEach(el => {
+document.querySelectorAll('.filter-toggle, .zoom-btn, .locate-btn, .share-btn, .theme-toggle, .sheet-close').forEach(el => {
   el.classList.add('pressable');
   el.addEventListener('touchstart', () => el.classList.add('pressed'), { passive: true });
   ['touchend', 'touchcancel'].forEach(evt => el.addEventListener(evt, () => el.classList.remove('pressed')));
@@ -444,7 +460,7 @@ function loadSavedView() {
 const savedView = loadSavedView();
 
 // Shared/deep-linked view, e.g.
-//   #map=12/34.9182/33.6221&filters=closures,jams&cvd=1
+//   #map=12/34.9182/33.6221&filters=closures,jams
 // Kept in the hash rather than the query string for two reasons: it never
 // reaches the server or the Worker's logs, and changing it doesn't look like
 // a different URL to the service worker's app-shell cache.
@@ -479,7 +495,6 @@ function parseHashView() {
     result.filters = filters.split(',').filter(f => SHAREABLE_FILTERS.includes(f));
   }
 
-  if (params.get('cvd') === '1') result.cvd = true;
   return Object.keys(result).length ? result : null;
 }
 const hashView = parseHashView();
@@ -614,16 +629,7 @@ document.querySelectorAll('.filter-toggle').forEach((btn) => {
   });
 });
 
-// Default is a standard red/yellow/green scale, indistinguishable for
-// red-green colorblind users (the most common form). The alternate is an
-// Okabe-Ito-style blue/orange/black scale, safe across all common types of
-// color vision deficiency, without needing to redesign the whole UI around
-// patterns/textures instead of color.
-const PALETTES = {
-  normal: { fast: '#2ecc71', moderate: '#f1c40f', slow: '#e74c3c' },
-  cvd: { fast: '#0072B2', moderate: '#E69F00', slow: '#000000' },
-};
-let colorblindMode = false;
+const PALETTE = { fast: '#2ecc71', moderate: '#f1c40f', slow: '#e74c3c' };
 
 // Fractions of a road's own free-flow speed, not absolute km/h. 50 km/h is
 // severe congestion on a motorway that normally runs at 110 (0.45) and
@@ -638,8 +644,8 @@ const RELATIVE_MODERATE = 0.5;
 // stays null for roads whose sensor never reports. Both fall back to the
 // absolute scale, which is what the legend describes in that state.
 function colorFor(speed, freeFlow) {
-  const p = colorblindMode ? PALETTES.cvd : PALETTES.normal;
-  if (speed == null || speed < 0) return '#95a5a6'; // -1 = malfunctioning sensor, same in both palettes
+  const p = PALETTE;
+  if (speed == null || speed < 0) return '#95a5a6'; // -1 = malfunctioning sensor
   if (freeFlow != null && freeFlow > 0) {
     const ratio = speed / freeFlow;
     if (ratio >= RELATIVE_FAST) return p.fast;
@@ -792,40 +798,9 @@ function fadeGroupOut(map, group, duration = 200) {
   setTimeout(() => { if (!stale()) map.removeLayer(group); }, duration);
 }
 
-const cvdToggleBtn = document.getElementById('cvdToggle');
-const legendFastEl = document.getElementById('legendFast');
-const legendModerateEl = document.getElementById('legendModerate');
-const legendSlowEl = document.getElementById('legendSlow');
-function applyPaletteToLegend() {
-  const p = colorblindMode ? PALETTES.cvd : PALETTES.normal;
-  legendFastEl.style.background = p.fast;
-  legendModerateEl.style.background = p.moderate;
-  legendSlowEl.style.background = p.slow;
-}
-cvdToggleBtn.addEventListener('click', (e) => {
-  e.stopPropagation(); // lives inside the legend header — don't also toggle collapse
-  haptic();
-  colorblindMode = !colorblindMode;
-  cvdToggleBtn.classList.toggle('active', colorblindMode);
-  applyPaletteToLegend();
-  // Recolor every already-drawn road in place — instantly, not animated,
-  // since this is a manual palette switch, not a data update. setColorNow
-  // (rather than a bare setStyle) also cancels any refresh animation still
-  // running, which would otherwise finish last and undo this. Updates
-  // entry.color too — that's the animateColor baseline in loadData above, so
-  // the next refresh doesn't animate back from the pre-toggle color.
-  for (const entry of layersById.values()) {
-    entry.color = colorFor(entry.hit.speedKmh, entry.hit.freeFlowKmh);
-    setColorNow(entry.visible, entry.color);
-  }
-});
-
-// Applied here, after both the filter chips and the palette toggle exist,
-// rather than at parse time up top — the layers and buttons this has to
-// touch aren't defined yet at that point. Roads haven't been drawn either,
-// so setting colorblindMode is enough on its own: the first colorFor call
-// during loadData already picks up the shared palette, with nothing to
-// recolor after the fact.
+// Applied here, after the filter chips exist, rather than at parse time up
+// top — the layers and buttons this has to touch aren't defined yet at that
+// point.
 if (hashView) {
   if (hashView.filters) {
     for (const key of hashView.filters) {
@@ -833,11 +808,6 @@ if (hashView) {
       map.addLayer(filterLayers[key]);
       document.querySelector(`.filter-toggle[data-filter="${key}"]`).classList.add('active');
     }
-  }
-  if (hashView.cvd) {
-    colorblindMode = true;
-    cvdToggleBtn.classList.add('active');
-    applyPaletteToLegend();
   }
 }
 
@@ -1093,11 +1063,10 @@ function buildShareUrl() {
   const parts = [`map=${map.getZoom()}/${c.lat.toFixed(5)}/${c.lng.toFixed(5)}`];
   const on = SHAREABLE_FILTERS.filter(key => filterVisible[key]);
   if (on.length) parts.push(`filters=${on.join(',')}`);
-  if (colorblindMode) parts.push('cvd=1');
   // Theme is deliberately not shared: it's a property of how the person
   // reading likes their screen, not of the traffic situation being pointed
-  // at. Filters and palette describe *what* the link is showing; theme
-  // doesn't, and forcing it would override the recipient's own preference.
+  // at. Filters describe *what* the link is showing; theme doesn't, and
+  // forcing it would override the recipient's own preference.
   return `${location.origin}${location.pathname}#${parts.join('&')}`;
 }
 
@@ -1247,9 +1216,16 @@ let lastGeneratedAt = null;
 function updateFreshnessLabel() {
   if (!lastGeneratedAt) return;
   const mins = Math.floor((Date.now() - lastGeneratedAt.getTime()) / 60000);
-  const text = mins < 1 ? 'Updated just now' : `Updated ${mins} min ago`;
+  const isStale = mins * 60000 > REFRESH_INTERVAL_MS * 2;
+  // Once stale, "Updated N min ago" reads like the app itself failed to sync
+  // with the Worker. It didn't — the app polled fine, the Worker just has
+  // nothing newer to serve (storeIfHealthy rejected everything since, see
+  // worker.js). Naming the feed, not the app, as the stuck party here.
+  const text = mins < 1 ? 'Updated just now'
+    : isStale ? `Feed stuck — last data (${mins}) min ago`
+    : `Updated ${mins} min ago`;
   freshnessTextEl.textContent = text;
-  freshnessEl.classList.toggle('stale', mins * 60000 > REFRESH_INTERVAL_MS * 2);
+  freshnessEl.classList.toggle('stale', isStale);
 }
 setInterval(updateFreshnessLabel, 30000);
 
@@ -1271,7 +1247,7 @@ function updateOutdatedNote() {
   const days = Math.floor(totalHours / 24);
   const hours = totalHours % 24;
   const duration = days >= 1 ? (days < 3 ? `${days}d ${hours}h` : `${days}d`) : `${totalHours}h`;
-  outdatedNoteEl.textContent = `Data outdated since ${since.toLocaleString()} (${duration})`;
+  outdatedNoteEl.textContent = `No upstream traffic feed since ${since.toLocaleString()} (${duration})`;
   outdatedNoteEl.hidden = false;
 }
 setInterval(updateOutdatedNote, 30000);
