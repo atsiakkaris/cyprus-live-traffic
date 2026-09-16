@@ -1209,21 +1209,35 @@ let initialLoadDone = false;
 // Flags data as stale at 2x the refresh interval — by then a normal refresh
 // should have landed, so still showing the old timestamp means something's
 // actually wrong upstream (as opposed to just "a couple minutes old").
+// Shared by both freshness lines below. A raw minute count stops being a
+// quick read once an outage runs for days — "7026 min ago" takes real
+// mental math, "4d 21h" doesn't. Escalates unit by how large the value is,
+// not by which line is calling it: minutes up to 90, then whole hours up to
+// 48h, then days+hours beyond that.
+function formatAge(ms) {
+  const mins = Math.floor(ms / 60000);
+  if (mins <= 90) return `${mins} min`;
+  const hours = Math.floor(ms / 3600000);
+  if (hours <= 48) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
+}
+
 const freshnessEl = document.getElementById('freshness');
 const freshnessTextEl = document.getElementById('freshnessText');
 const outdatedNoteEl = document.getElementById('outdatedNote');
 let lastGeneratedAt = null;
 function updateFreshnessLabel() {
   if (!lastGeneratedAt) return;
-  const mins = Math.floor((Date.now() - lastGeneratedAt.getTime()) / 60000);
-  const isStale = mins * 60000 > REFRESH_INTERVAL_MS * 2;
+  const ageMs = Date.now() - lastGeneratedAt.getTime();
+  const isStale = ageMs > REFRESH_INTERVAL_MS * 2;
   // Once stale, "Updated N min ago" reads like the app itself failed to sync
   // with the Worker. It didn't — the app polled fine, the Worker just has
   // nothing newer to serve (storeIfHealthy rejected everything since, see
   // worker.js). Naming the feed, not the app, as the stuck party here.
-  const text = mins < 1 ? 'Updated just now'
-    : isStale ? `Feed stuck — last data (${mins}) min ago`
-    : `Updated ${mins} min ago`;
+  const text = ageMs < 60000 ? 'Updated just now'
+    : isStale ? `Feed stuck — last data (${formatAge(ageMs)}) ago`
+    : `Updated ${formatAge(ageMs)} ago`;
   freshnessTextEl.textContent = text;
   freshnessEl.classList.toggle('stale', isStale);
 }
@@ -1243,11 +1257,7 @@ function updateOutdatedNote() {
   const since = new Date(commonMeasurementTimestamp);
   const ageMs = Date.now() - since.getTime();
   if (ageMs <= OUTDATED_THRESHOLD_MS) { outdatedNoteEl.hidden = true; return; }
-  const totalHours = Math.floor(ageMs / 3600000);
-  const days = Math.floor(totalHours / 24);
-  const hours = totalHours % 24;
-  const duration = days >= 1 ? (days < 3 ? `${days}d ${hours}h` : `${days}d`) : `${totalHours}h`;
-  outdatedNoteEl.textContent = `No upstream traffic feed since ${since.toLocaleString()} (${duration})`;
+  outdatedNoteEl.textContent = `No upstream traffic feed since ${since.toLocaleString()} (${formatAge(ageMs)})`;
   outdatedNoteEl.hidden = false;
 }
 setInterval(updateOutdatedNote, 30000);
