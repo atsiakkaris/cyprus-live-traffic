@@ -520,6 +520,125 @@ function updateBaselines(prev, paths) {
   return next;
 }
 
+// --- Typical speed by time of day -------------------------------------------
+//
+// Free flow says how fast a road *can* go; it can't say whether 40 km/h at
+// 08:30 on a Tuesday is a crawl or just Tuesday. So each path also keeps a
+// running median speed per 30-minute slot of the day, separately for weekdays
+// and for weekends/public holidays — what is normal *at this time, on this
+// kind of day*. The app compares the live reading against it
+// (I_anom = typical / speed * 100, the Anomaly Indicator).
+//
+// Slots are Nicosia local time, not UTC, so they stay put across daylight
+// saving: 08:30 is the morning peak all year, whichever offset applies. That
+// also means a local hour can be visited twice (autumn) or never (spring) —
+// both are fine, a slot is just "that clock time".
+const PROFILE_SLOT_MINUTES = 30;
+
+// Created once per isolate: building an Intl.DateTimeFormat is real CPU and
+// the budget is ~10 ms per invocation. en-US + hourCycle h23 keeps the parts
+// stable (Latin digits, midnight as "00" rather than "24"). The weekday is
+// derived from the date below instead of formatted, so no locale's weekday
+// abbreviations are ever relied on.
+const NICOSIA_CLOCK = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Nicosia",
+  year: "numeric", month: "numeric", day: "numeric",
+  hour: "numeric", minute: "numeric",
+  hourCycle: "h23",
+});
+
+function nicosiaClock(ms) {
+  const parts = {};
+  for (const p of NICOSIA_CLOCK.formatToParts(ms)) parts[p.type] = p.value;
+  return {
+    year: Number(parts.year), month: Number(parts.month), day: Number(parts.day),
+    hour: Number(parts.hour), minute: Number(parts.minute),
+  };
+}
+
+function ymd(year, month, day) {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+// Orthodox Easter Sunday as a Gregorian {month, day}: Meeus' Julian
+// algorithm, then +13 days to convert Julian to Gregorian (the offset is 13
+// from 1900 through 2099).
+function orthodoxEaster(year) {
+  const a = year % 4;
+  const b = year % 7;
+  const c = year % 19;
+  const d = (19 * c + 15) % 30;
+  const e = (2 * a + 4 * b - d + 34) % 7;
+  const julianMonth = Math.floor((d + e + 114) / 31);
+  const julianDay = ((d + e + 114) % 31) + 1;
+  const g = new Date(Date.UTC(year, julianMonth - 1, julianDay + 13));
+  return { month: g.getUTCMonth() + 1, day: g.getUTCDate() };
+}
+
+// Public holidays that count as "weekend" for profiling. Cross-checked on
+// 2026-10-14 against CySEC's published 2026 list and two Cypriot embassy
+// pages; the Public Service's own list and the holiday law could not be
+// reached, so this is NOT verified against the primary source — re-check it
+// each January. Two judgement calls: 24 December is included (CySEC and the
+// embassies list it), Easter Tuesday is not (no Cypriot source lists it).
+// Holy Saturday and Easter Sunday need no entry — they are always a Saturday
+// and a Sunday. No "observed on Monday" substitution is modelled; Cyprus
+// doesn't shift holidays that fall on a weekend.
+const CYPRUS_FIXED_HOLIDAYS = [
+  "01-01", // New Year's Day
+  "01-06", // Epiphany
+  "03-25", // Greek Independence Day
+  "04-01", // Cyprus National Day
+  "05-01", // Labour Day
+  "08-15", // Assumption
+  "10-01", // Cyprus Independence Day
+  "10-28", // Ochi Day
+  "12-24", // Christmas Eve
+  "12-25", // Christmas Day
+  "12-26", // Boxing Day
+];
+// Days relative to Orthodox Easter Sunday.
+const CYPRUS_EASTER_OFFSETS = [
+  -48, // Green Monday (Clean Monday)
+  -2, // Good Friday
+  1, // Easter Monday
+  50, // Whit Monday (Kataklysmos)
+];
+
+const holidayCache = new Map();
+
+function cyprusHolidays(year) {
+  let set = holidayCache.get(year);
+  if (set) return set;
+  set = new Set(CYPRUS_FIXED_HOLIDAYS.map((md) => `${year}-${md}`));
+  const easter = orthodoxEaster(year);
+  const easterMs = Date.UTC(year, easter.month - 1, easter.day);
+  for (const offset of CYPRUS_EASTER_OFFSETS) {
+    const d = new Date(easterMs + offset * 86400000);
+    set.add(ymd(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()));
+  }
+  holidayCache.set(year, set);
+  return set;
+}
+
+// Which profile slot an instant falls in. `key` ("wd:0830" / "we:1400") names
+// the slot; the KV key for its stored estimates is "profile:" + key.
+function slotFor(ms) {
+  const c = nicosiaClock(ms);
+  const holiday = cyprusHolidays(c.year).has(ymd(c.year, c.month, c.day));
+  const dow = new Date(Date.UTC(c.year, c.month - 1, c.day)).getUTCDay(); // 0 = Sunday
+  const weekend = dow === 0 || dow === 6 || holiday;
+  const startMinute = Math.floor(c.minute / PROFILE_SLOT_MINUTES) * PROFILE_SLOT_MINUTES;
+  const hh = String(c.hour).padStart(2, "0");
+  const mm = String(startMinute).padStart(2, "0");
+  return {
+    key: `${weekend ? "we" : "wd"}:${hh}${mm}`,
+    dayType: weekend ? "weekend" : "weekday",
+    holiday,
+    starts: `${hh}:${mm}`,
+  };
+}
+
 // Road geometry (shape of each path) essentially never changes tick to tick
 // — re-fetching and re-parsing it every 5 min was the single heaviest chunk
 // of the CPU budget that caused the exceededCpu failures above, for data
