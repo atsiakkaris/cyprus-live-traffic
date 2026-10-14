@@ -100,6 +100,45 @@ export class FakeUpstream {
   }
 }
 
+export const CRON_5MIN = '*/5 * * * *';
+export const CRON_GEOMETRY = '0 */6 * * *';
+
+// Path ids "p00".."pNN". The Worker refuses snapshots under 50 paths
+// (MIN_HEALTHY_PATH_COUNT), so tests that expect writes need at least 50.
+export function pathIds(n) {
+  return Array.from({ length: n }, (_, i) => `p${String(i).padStart(2, '0')}`);
+}
+
+// Pre-populate the geometry cache exactly as fetchAndCacheGeometry stores it,
+// so a tick doesn't spend a KV write (or a geometry fetch) on first use.
+export function seedGeometry(kv, ids) {
+  const entries = ids.map((id, i) => [id, { name: `Path ${id}`, coords: [[35.1 + i / 1000, 33.3], [35.1 + i / 1000, 33.4]] }]);
+  kv.store.set('geometry', JSON.stringify(entries));
+}
+
+// Run one scheduled invocation the way the runtime would.
+export async function runTick(w, env, { cron = CRON_5MIN, scheduledTime = Date.now() } = {}) {
+  await w.default.scheduled({ cron, scheduledTime }, env);
+}
+
+// Collect console.error / console.log output instead of printing it.
+export function captureConsole() {
+  const errors = [];
+  const logs = [];
+  const origError = console.error;
+  const origLog = console.log;
+  console.error = (...a) => errors.push(a.map(String).join(' '));
+  console.log = (...a) => logs.push(a.map(String).join(' '));
+  return {
+    errors,
+    logs,
+    restore() {
+      console.error = origError;
+      console.log = origLog;
+    },
+  };
+}
+
 // Deterministic PRNG (mulberry32) so randomized tests are reproducible.
 export function prng(seed) {
   let a = seed >>> 0;

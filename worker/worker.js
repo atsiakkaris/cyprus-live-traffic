@@ -384,6 +384,10 @@ const FETCH_EVENTS = true;
 // So instead each path learns its own free-flow speed from what it actually
 // observes. No classification, no manual table to maintain, and it adapts on
 // its own if a road changes.
+//
+// BASELINE_KEY is where the baselines lived before the "state" key existed.
+// It is read once, to carry them over when "state" is absent (see readState),
+// and is never written again — it's left in place on purpose.
 const BASELINE_KEY = "baselines";
 
 // Tracked as a running 95th percentile rather than a max: a max is set
@@ -472,6 +476,63 @@ async function readBaselines(env) {
     console.error("Baselines unparseable — starting over");
     return {};
   }
+}
+
+// --- Learned state ----------------------------------------------------------
+//
+// Everything the Worker learns lives in one KV value, "state", so a healthy
+// tick costs a fixed three writes (latest, state, staleness) however much is
+// learned — the Free plan allows 1,000 KV writes a day across all keys:
+//
+//   { v: 1,
+//     baselines: { [pathId]: [freeFlowKmh, samples] },
+//     slot: { key, paths: { [pathId]: [typicalKmh, samples] } } | null }
+//
+// `slot` is the typical-speed profile slot currently being learned (null
+// until the first tick); finished slots are written once each to their own
+// "profile:<slot key>" key.
+const STATE_KEY = "state";
+
+function emptyState() {
+  return { v: 1, baselines: {}, slot: null };
+}
+
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+// Returns a normalised state, or null if `raw` isn't a usable one.
+function parseState(raw) {
+  let s;
+  try {
+    s = JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+  if (!isPlainObject(s) || !isPlainObject(s.baselines)) return null;
+  const slot = s.slot === undefined ? null : s.slot;
+  if (slot !== null && !(isPlainObject(slot) && typeof slot.key === "string" && isPlainObject(slot.paths))) {
+    return null;
+  }
+  return { v: 1, baselines: s.baselines, slot };
+}
+
+async function readState(env) {
+  const raw = await env.TRAFFIC_KV.get(STATE_KEY);
+  if (raw !== null && raw !== undefined) {
+    const state = parseState(raw);
+    if (state) return state;
+    // State exists but is unusable: start empty and say so. Deliberately NOT
+    // a reason to fall back to the old "baselines" key — that key stopped
+    // being updated when "state" was introduced, so loading it would
+    // silently resurrect stale free-flow speeds.
+    console.error("State unparseable or malformed — starting its learned state over");
+    return emptyState();
+  }
+  // No "state" yet: first run since it was introduced. Carry over the
+  // free-flow speeds already learned under the old key instead of making
+  // every road relearn a day of context.
+  return { ...emptyState(), baselines: await readBaselines(env) };
 }
 
 // One step of the stochastic-approximation quantile estimator both the
@@ -673,18 +734,18 @@ async function loadGeometry(env) {
   return fetchAndCacheGeometry(env);
 }
 
-// Returns the snapshot plus the updated baselines rather than writing the
-// latter itself: baselines must only be persisted alongside a snapshot that
-// passes the health checks, so that a broken upstream feed can't quietly
-// teach every road a wrong idea of normal. storeIfHealthy owns both writes.
+// Returns the snapshot plus the updated learned state rather than writing the
+// latter itself: learned state must only be persisted alongside a snapshot
+// that passes the health checks, so that a broken upstream feed can't quietly
+// teach every road a wrong idea of normal. storeIfHealthy owns all the writes.
 async function buildSnapshot(env, { refreshGeometry = false } = {}) {
-  const [geometry, liveText, alertsRaw, jams, situations, prevBaselines, prevStaleness] = await Promise.all([
+  const [geometry, liveText, alertsRaw, jams, situations, prevState, prevStaleness] = await Promise.all([
     refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
     fetchText(LIVE_URL),
     FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication") : Promise.resolve([]),
-    readBaselines(env),
+    readState(env),
     readStaleness(env),
   ]);
 
@@ -697,7 +758,7 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     paths.push({ id: pid, name: geo.name, coords: geo.coords, ...liveData });
   }
 
-  const baselines = updateBaselines(prevBaselines, paths);
+  const baselines = updateBaselines(prevState.baselines, paths);
   for (const p of paths) {
     const b = baselines[p.id];
     // Null until warmed up — the app treats that as "no baseline, use the
@@ -748,7 +809,7 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     situations,
   };
 
-  return { snapshot, baselines, staleness };
+  return { snapshot, state: { v: 1, baselines, slot: prevState.slot }, staleness };
 }
 
 function modeMeasuredAt(paths) {
@@ -828,7 +889,7 @@ function unhealthyReason(snapshot) {
   return null;
 }
 
-async function storeIfHealthy(env, snapshot, baselines, staleness) {
+async function storeIfHealthy(env, snapshot, state, staleness) {
   const reason = unhealthyReason(snapshot);
   if (reason) {
     console.error(`Refusing to store suspicious snapshot: ${reason} (upstream likely broken)`);
@@ -838,7 +899,7 @@ async function storeIfHealthy(env, snapshot, baselines, staleness) {
     env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot)),
     // Gated on the same health check as the snapshot itself: a degraded feed
     // must not get a vote on what each road's normal speed looks like.
-    env.TRAFFIC_KV.put(BASELINE_KEY, JSON.stringify(baselines)),
+    env.TRAFFIC_KV.put(STATE_KEY, JSON.stringify(state)),
     // Same gating logic, and for the same reason as above — a rejected
     // snapshot's readings shouldn't reset or advance any path's unchanged
     // streak either.
@@ -854,8 +915,8 @@ const GEOMETRY_CRON = "0 */6 * * *";
 
 export default {
   async scheduled(event, env) {
-    const { snapshot, baselines, staleness } = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
-    await storeIfHealthy(env, snapshot, baselines, staleness);
+    const { snapshot, state, staleness } = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
+    await storeIfHealthy(env, snapshot, state, staleness);
   },
 
   async fetch(request, env) {
@@ -870,8 +931,8 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
       console.log(`GET /refresh from ${describeCaller(request)}`);
-      const { snapshot, baselines, staleness } = await buildSnapshot(env, { refreshGeometry: true });
-      const reason = await storeIfHealthy(env, snapshot, baselines, staleness);
+      const { snapshot, state, staleness } = await buildSnapshot(env, { refreshGeometry: true });
+      const reason = await storeIfHealthy(env, snapshot, state, staleness);
       if (reason) {
         return new Response(
           JSON.stringify({ error: `Upstream returned a suspiciously broken feed (${reason}) — last good snapshot kept.`, ...snapshot }),
