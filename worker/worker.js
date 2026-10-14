@@ -474,6 +474,22 @@ async function readBaselines(env) {
   }
 }
 
+// One step of the stochastic-approximation quantile estimator both the
+// free-flow baselines and the per-slot typical-speed profiles are built on:
+//
+//   q <- q + eta * (p - 1[x <= q])
+//
+// i.e. nudge up by eta*p when the reading x is above the estimate, down by
+// eta*(1-p) otherwise, so q settles at the p-quantile of the readings.
+// p = 0.95 gives a free-flow speed, p = 0.5 a median. Rounded to two
+// decimals — see updateBaselines for why one is not enough. The operand
+// order is deliberate: it must stay bit-for-bit what updateBaselines computed
+// before this was extracted.
+function quantileStep(q, x, p, eta) {
+  const step = x > q ? eta * p : -eta * (1 - p);
+  return Math.round((q + step) * 100) / 100;
+}
+
 // Returns a fresh object keyed only by paths in the current geometry, which
 // is what keeps this from growing without bound as the upstream road network
 // changes over the years (an earlier review caught the same class of bug in
@@ -494,15 +510,12 @@ function updateBaselines(prev, paths) {
       continue;
     }
     const [q, n] = old;
-    const step = p.speed_kmh > q
-      ? BASELINE_STEP_KMH * BASELINE_TARGET_P
-      : -BASELINE_STEP_KMH * (1 - BASELINE_TARGET_P);
-    // Two decimals, not one: the downward step is only 0.025 km/h, so
-    // rounding to 1dp snapped every decrease straight back to where it
-    // started and the estimate could only ever ratchet upward — a baseline
-    // that silently never adapts down. 2dp is still enough to keep float
-    // drift from growing the stored JSON with 17-digit values.
-    next[p.id] = [Math.round((q + step) * 100) / 100, n + 1];
+    // Two decimals, not one (inside quantileStep): the downward step is only
+    // 0.025 km/h, so rounding to 1dp snapped every decrease straight back to
+    // where it started and the estimate could only ever ratchet upward — a
+    // baseline that silently never adapts down. 2dp is still enough to keep
+    // float drift from growing the stored JSON with 17-digit values.
+    next[p.id] = [quantileStep(q, p.speed_kmh, BASELINE_TARGET_P, BASELINE_STEP_KMH), n + 1];
   }
   return next;
 }
