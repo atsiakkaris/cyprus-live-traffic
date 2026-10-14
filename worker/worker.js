@@ -1017,11 +1017,35 @@ async function storeIfHealthy(env, snapshot, state, staleness, flush = null) {
 // above). Every other cron firing (the 5-min tick) uses the cached copy.
 const GEOMETRY_CRON = "0 */6 * * *";
 
+// True at 00:00, 06:00, 12:00 and 18:00 UTC — the minutes GEOMETRY_CRON
+// ("0 */6 * * *") fires, and so the minutes the 5-minute cron fires alongside
+// it. Written out here rather than parsed from the cron string; a test checks
+// it against wrangler.toml so the two can't drift apart.
+function coincidesWithGeometryCron(ms) {
+  const d = new Date(ms);
+  return d.getUTCMinutes() === 0 && d.getUTCHours() % 6 === 0;
+}
+
 export default {
   async scheduled(event, env) {
+    const nowMs = tickTimeMs(event);
+    // At those four minutes a day both crons match and the runtime starts two
+    // invocations at once. Without this each would run a full tick: two lots of
+    // KV writes against a 1,000-a-day budget, and two runs racing to
+    // read-modify-write the same keys. The geometry run is the one that
+    // refreshes geometry, so it keeps the minute's tick and the 5-minute run
+    // steps aside. The raw scheduledTime is logged so its unit (ms vs s) can be
+    // confirmed from the logs.
+    if (event.cron !== GEOMETRY_CRON && coincidesWithGeometryCron(nowMs)) {
+      console.log(
+        `Skipping the "${event.cron}" tick at ${new Date(nowMs).toISOString()} ` +
+        `(scheduledTime=${event.scheduledTime}): the geometry cron runs this minute's tick`
+      );
+      return;
+    }
     const { snapshot, state, flush, staleness } = await buildSnapshot(env, {
       refreshGeometry: event.cron === GEOMETRY_CRON,
-      nowMs: tickTimeMs(event),
+      nowMs,
     });
     await storeIfHealthy(env, snapshot, state, staleness, flush);
   },
