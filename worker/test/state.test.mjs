@@ -1,23 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadWorker } from './load-worker.mjs';
-import { MockKV, FakeUpstream, pathIds, seedGeometry, runTick, captureConsole } from './mocks.mjs';
+import { MockKV, pathIds, runTick, withWorld } from './mocks.mjs';
 
 const w = await loadWorker();
 const IDS = pathIds(60);
-
-// Run `fn` against a fresh KV + fake upstream, always restoring globals.
-async function withWorld({ kv = new MockKV(), speedOf = () => 70, ids = IDS } = {}, fn) {
-  seedGeometry(kv, ids);
-  const upstream = new FakeUpstream(ids, speedOf).install();
-  const con = captureConsole();
-  try {
-    return await fn({ kv, upstream, con, env: { TRAFFIC_KV: kv } });
-  } finally {
-    con.restore();
-    upstream.restore();
-  }
-}
 
 const oldBaselines = () => Object.fromEntries(IDS.map((id) => [id, [60.5, 100]]));
 
@@ -34,7 +21,7 @@ test('first run migrates free-flow baselines from the old key and leaves it alon
     await runTick(w, env);
     const state = kv.json('state');
     assert.deepStrictEqual(state.baselines.p00, [w.quantileStep(60.5, 70, 0.95, 0.5), 101]);
-    assert.equal(state.slot, null);
+    assert.equal(typeof state.slot.key, 'string', 'the profile slot being learned is recorded in state');
     assert.equal(kv.putCount('baselines'), 0, 'the old key is never written');
     assert.deepStrictEqual(JSON.parse(kv.store.get('baselines')), oldBaselines(), 'and is left untouched');
   });

@@ -551,34 +551,43 @@ function quantileStep(q, x, p, eta) {
   return Math.round((q + step) * 100) / 100;
 }
 
+// Advances one set of per-path estimates ({ [pathId]: [q, samples] }) by one
+// tick of readings, with the given quantile p and step eta. Shared by the
+// free-flow baselines and the typical-speed profile slots.
+//
 // Returns a fresh object keyed only by paths in the current geometry, which
 // is what keeps this from growing without bound as the upstream road network
 // changes over the years (an earlier review caught the same class of bug in
 // the service worker's tile cache).
-function updateBaselines(prev, paths) {
+function updateEstimates(prev, paths, p, eta) {
   const next = {};
-  for (const p of paths) {
-    const old = prev[p.id];
+  for (const path of paths) {
+    const old = prev[path.id];
     // A dead sensor (-1) or missing reading is not evidence about the road,
     // so carry the existing estimate forward untouched rather than letting
-    // an outage drag every baseline toward zero.
-    if (p.speed_kmh == null || p.speed_kmh < 0) {
-      if (old) next[p.id] = old;
+    // an outage drag every estimate toward zero.
+    if (path.speed_kmh == null || path.speed_kmh < 0) {
+      if (old) next[path.id] = old;
       continue;
     }
     if (!old) {
-      next[p.id] = [p.speed_kmh, 1];
+      next[path.id] = [path.speed_kmh, 1];
       continue;
     }
     const [q, n] = old;
-    // Two decimals, not one (inside quantileStep): the downward step is only
-    // 0.025 km/h, so rounding to 1dp snapped every decrease straight back to
-    // where it started and the estimate could only ever ratchet upward — a
-    // baseline that silently never adapts down. 2dp is still enough to keep
-    // float drift from growing the stored JSON with 17-digit values.
-    next[p.id] = [quantileStep(q, p.speed_kmh, BASELINE_TARGET_P, BASELINE_STEP_KMH), n + 1];
+    // Two decimals, not one (inside quantileStep): the free-flow downward
+    // step is only 0.025 km/h, so rounding to 1dp snapped every decrease
+    // straight back to where it started and the estimate could only ever
+    // ratchet upward — a baseline that silently never adapts down. 2dp is
+    // still enough to keep float drift from growing the stored JSON with
+    // 17-digit values.
+    next[path.id] = [quantileStep(q, path.speed_kmh, p, eta), n + 1];
   }
   return next;
+}
+
+function updateBaselines(prev, paths) {
+  return updateEstimates(prev, paths, BASELINE_TARGET_P, BASELINE_STEP_KMH);
 }
 
 // --- Typical speed by time of day -------------------------------------------
@@ -595,6 +604,26 @@ function updateBaselines(prev, paths) {
 // also means a local hour can be visited twice (autumn) or never (spring) —
 // both are fine, a slot is just "that clock time".
 const PROFILE_SLOT_MINUTES = 30;
+
+// The same estimator as the free-flow baselines, aimed at the median (p = 0.5)
+// with a larger step: a slot only sees one reading per tick, six a day, so it
+// has to move faster to settle within a few days. Each step moves the
+// estimate by at most eta*(p or 1-p) = 0.5 km/h.
+const PROFILE_TARGET_P = 0.5;
+const PROFILE_STEP_KMH = 1.0;
+
+// Withheld from the snapshot until a slot's estimate has seen this many
+// readings — 18 is three matching days at six readings a day — so the app
+// doesn't present a number that's still just the first reading it was seeded
+// with. Counted per path per slot in actual readings, like MIN_BASELINE_SAMPLES.
+// Caveat: a bad first reading (the feed does emit implausible values) seeds a
+// bad estimate, and at 0.5 km/h per reading it takes weeks to heal; nothing
+// here detects that.
+const MIN_PROFILE_SAMPLES = 18;
+
+// Finished slots are stored one per key, "profile:wd:0830" / "profile:we:1400"
+// — 96 keys in all, each written once as its slot ends.
+const PROFILE_KEY_PREFIX = "profile:";
 
 // Created once per isolate: building an Intl.DateTimeFormat is real CPU and
 // the budget is ~10 ms per invocation. en-US + hourCycle h23 keeps the parts
@@ -700,6 +729,38 @@ function slotFor(ms) {
   };
 }
 
+function updateProfile(prev, paths) {
+  return updateEstimates(prev, paths, PROFILE_TARGET_P, PROFILE_STEP_KMH);
+}
+
+// A slot's stored estimates, or {} if it has never been written. A corrupt
+// value costs that one slot a few days of learning, not the whole tick.
+async function readSlot(env, slotKey) {
+  const raw = await env.TRAFFIC_KV.get(PROFILE_KEY_PREFIX + slotKey);
+  if (raw === null || raw === undefined) return {};
+  try {
+    const paths = JSON.parse(raw);
+    if (isPlainObject(paths)) return paths;
+  } catch (e) {
+    // fall through to the error below
+  }
+  console.error(`Profile slot ${slotKey} unparseable — starting it over`);
+  return {};
+}
+
+// The instant a tick is *for*: the cron's scheduled time, so a run that
+// starts a few seconds late still lands in the right slot (and so tests can
+// say exactly when a tick happens). Falls back to now, which is what /refresh
+// has — it isn't a scheduled event. The runtime documents scheduledTime in
+// milliseconds, but the Observability logs show the same field in seconds, so
+// either is accepted: anything below 1e11 can only be seconds (1e11 ms is
+// early 1973, 1e11 s is the year 5138).
+function tickTimeMs(event) {
+  const t = Number(event && event.scheduledTime);
+  if (!Number.isFinite(t) || t <= 0) return Date.now();
+  return t < 1e11 ? t * 1000 : t;
+}
+
 // Road geometry (shape of each path) essentially never changes tick to tick
 // — re-fetching and re-parsing it every 5 min was the single heaviest chunk
 // of the CPU budget that caused the exceededCpu failures above, for data
@@ -738,7 +799,7 @@ async function loadGeometry(env) {
 // latter itself: learned state must only be persisted alongside a snapshot
 // that passes the health checks, so that a broken upstream feed can't quietly
 // teach every road a wrong idea of normal. storeIfHealthy owns all the writes.
-async function buildSnapshot(env, { refreshGeometry = false } = {}) {
+async function buildSnapshot(env, { refreshGeometry = false, nowMs = Date.now() } = {}) {
   const [geometry, liveText, alertsRaw, jams, situations, prevState, prevStaleness] = await Promise.all([
     refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
     fetchText(LIVE_URL),
@@ -764,6 +825,27 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     // Null until warmed up — the app treats that as "no baseline, use the
     // absolute thresholds" rather than guessing from a half-learned value.
     p.free_flow_kmh = (b && b[1] >= MIN_BASELINE_SAMPLES) ? b[0] : null;
+  }
+
+  // Typical speed for this time of day. When the clock has moved into a new
+  // slot, the slot being learned is handed back as `flush` (storeIfHealthy
+  // writes it once, to its own key) and the new slot's stored estimates are
+  // loaded. Nothing is persisted here: if this tick turns out unhealthy the
+  // stored state still points at the old slot, so the first healthy tick
+  // after any run of bad ones does the hand-over — nothing in the finished
+  // slot is lost.
+  const slot = slotFor(nowMs);
+  let slotState = prevState.slot;
+  let flush = null;
+  if (!slotState || slotState.key !== slot.key) {
+    flush = slotState;
+    slotState = { key: slot.key, paths: await readSlot(env, slot.key) };
+  }
+  const slotPaths = updateProfile(slotState.paths, paths);
+  for (const p of paths) {
+    const s = slotPaths[p.id];
+    // Null until warmed up, like free_flow_kmh: the app shows nothing for it.
+    p.typical_kmh = (s && s[1] >= MIN_PROFILE_SAMPLES) ? s[0] : null;
   }
 
   // Tracking runs every tick regardless (see updateStaleness above), but as
@@ -802,6 +884,10 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     // at /refresh) tell "still learning" apart from "learned, and this road
     // genuinely has no data".
     baseline_ready_count: paths.filter((p) => p.free_flow_kmh != null).length,
+    // Which slot every path's typical_kmh is for, and how many paths have one
+    // yet — the typical-speed counterpart of baseline_ready_count.
+    typical_slot: { day_type: slot.dayType, starts: slot.starts, holiday: slot.holiday },
+    typical_ready_count: paths.filter((p) => p.typical_kmh != null).length,
     paths,
     alerts,
     road_closures,
@@ -809,7 +895,12 @@ async function buildSnapshot(env, { refreshGeometry = false } = {}) {
     situations,
   };
 
-  return { snapshot, state: { v: 1, baselines, slot: prevState.slot }, staleness };
+  return {
+    snapshot,
+    state: { v: 1, baselines, slot: { key: slot.key, paths: slotPaths } },
+    flush,
+    staleness,
+  };
 }
 
 function modeMeasuredAt(paths) {
@@ -889,11 +980,24 @@ function unhealthyReason(snapshot) {
   return null;
 }
 
-async function storeIfHealthy(env, snapshot, state, staleness) {
+// `flush` is a finished profile slot ({ key, paths }) when the clock has moved
+// into a new one, else null. It is written before — and on its own, not in the
+// Promise.all below — because `state` is what remembers which slot is being
+// learned. If the flush were written alongside and `state` landed first, a
+// failed flush would leave `state` already pointing at the new slot with the
+// old slot's readings gone. In this order a failed flush throws before
+// anything else is written, so `state` still holds the old slot and the next
+// healthy tick simply tries again; and a failed `state` write after a good
+// flush just re-writes the same slot next time. Either way nothing is lost.
+// Empty slots aren't written (nothing to keep, and a write is a scarce thing).
+async function storeIfHealthy(env, snapshot, state, staleness, flush = null) {
   const reason = unhealthyReason(snapshot);
   if (reason) {
     console.error(`Refusing to store suspicious snapshot: ${reason} (upstream likely broken)`);
     return reason;
+  }
+  if (flush && Object.keys(flush.paths).length > 0) {
+    await env.TRAFFIC_KV.put(PROFILE_KEY_PREFIX + flush.key, JSON.stringify(flush.paths));
   }
   await Promise.all([
     env.TRAFFIC_KV.put("latest", JSON.stringify(snapshot)),
@@ -915,8 +1019,11 @@ const GEOMETRY_CRON = "0 */6 * * *";
 
 export default {
   async scheduled(event, env) {
-    const { snapshot, state, staleness } = await buildSnapshot(env, { refreshGeometry: event.cron === GEOMETRY_CRON });
-    await storeIfHealthy(env, snapshot, state, staleness);
+    const { snapshot, state, flush, staleness } = await buildSnapshot(env, {
+      refreshGeometry: event.cron === GEOMETRY_CRON,
+      nowMs: tickTimeMs(event),
+    });
+    await storeIfHealthy(env, snapshot, state, staleness, flush);
   },
 
   async fetch(request, env) {
@@ -931,8 +1038,8 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
       console.log(`GET /refresh from ${describeCaller(request)}`);
-      const { snapshot, state, staleness } = await buildSnapshot(env, { refreshGeometry: true });
-      const reason = await storeIfHealthy(env, snapshot, state, staleness);
+      const { snapshot, state, flush, staleness } = await buildSnapshot(env, { refreshGeometry: true });
+      const reason = await storeIfHealthy(env, snapshot, state, staleness, flush);
       if (reason) {
         return new Response(
           JSON.stringify({ error: `Upstream returned a suspiciously broken feed (${reason}) — last good snapshot kept.`, ...snapshot }),

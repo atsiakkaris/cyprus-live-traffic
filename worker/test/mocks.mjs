@@ -121,6 +121,32 @@ export async function runTick(w, env, { cron = CRON_5MIN, scheduledTime = Date.n
   await w.default.scheduled({ cron, scheduledTime }, env);
 }
 
+// Run `fn` against a fresh world: a KV (optionally pre-populated), the fake
+// upstream installed on global fetch, and console output captured. Always
+// restores the globals, even when `fn` throws.
+export async function withWorld({ kv = new MockKV(), speedOf = () => 70, ids = pathIds(60) } = {}, fn) {
+  seedGeometry(kv, ids);
+  const upstream = new FakeUpstream(ids, speedOf).install();
+  const con = captureConsole();
+  try {
+    return await fn({ kv, upstream, con, env: { TRAFFIC_KV: kv } });
+  } finally {
+    con.restore();
+    upstream.restore();
+  }
+}
+
+// Run scheduled ticks from `fromMs` (inclusive) to `toMs` (exclusive), one
+// every `stepMs`. `speedOf(id, t)` gives each path's reading at tick time t;
+// `onTick(t)` runs after each tick (e.g. to inspect KV at a chosen moment).
+export async function simulate(w, env, upstream, { fromMs, toMs, stepMs = 5 * 60000, speedOf, cron = CRON_5MIN, onTick }) {
+  for (let t = fromMs; t < toMs; t += stepMs) {
+    upstream.speedOf = (id) => speedOf(id, t);
+    await runTick(w, env, { cron, scheduledTime: t });
+    if (onTick) await onTick(t);
+  }
+}
+
 // Collect console.error / console.log output instead of printing it.
 export function captureConsole() {
   const errors = [];
