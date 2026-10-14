@@ -56,6 +56,32 @@ reference / redeploying from scratch if ever needed.
    to point at that Worker URL instead of the local file, and retire the
    `poll.yml` GitHub Action + committed `preview/latest.json`.~~ **Done.**
 
+## What the Worker learns, and what it costs
+
+**KV keys.** `latest` (snapshot), `geometry` (cached roads, 4×/day),
+`staleness` (unchanged-reading streaks), `state` (`{v, baselines, slot}`:
+free-flow estimates plus the typical-speed slot being learned), and 96
+`profile:wd:HHMM` / `profile:we:HHMM` keys, one per finished slot, each
+written once as its slot ends. `baselines` is the pre-`state` location: read
+once to migrate if `state` is absent, never written again.
+
+**Typical speed.** Per path, per 30-minute slot of Nicosia local time,
+weekday vs weekend (Sat/Sun and Cyprus public holidays); the free-flow
+estimator aimed at the median (≤ 0.5 km/h per reading). `typical_kmh` is null
+until a slot has 18 readings. Holidays are checked against CySEC's list, not
+the Public Service's — re-check each January. A bad first reading seeds a bad
+estimate that takes weeks to heal.
+
+**Write budget** (Free plan: 1,000 KV writes/day across all keys, resets
+00:00 UTC; going over fails writes, including `latest`): 288 ticks × 3
+(latest, state, staleness) = 864, + 48 slot flushes, + 4 geometry =
+**916/day**, 84 spare; each `/refresh` costs 4. The 5-minute cron skips the
+four minutes the geometry cron also fires (00/06/12/18 UTC), which used to
+double the tick.
+
+**Tests.** `node --test "worker/test/*.test.mjs"` from the repo root (Node ≥ 22,
+which expands the glob itself, so it works in PowerShell too; no packages).
+
 ## Note on Workers' CPU time limit
 
 The free plan caps CPU time per request at ~10ms — this **is** a real
@@ -71,3 +97,5 @@ in KV freed up enough budget for the 5-min tick to comfortably handle the
 other 4 feeds. If `exceededCpu` errors show up again in Observability
 Logs, that's the first place to look — either something got heavier again,
 or it's time to consider the Workers Paid plan (raises the CPU cap to 30s).
+The four geometry ticks double as slot-rollover ticks, so check Observability
+for `exceededCpu` there first.

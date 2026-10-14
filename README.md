@@ -17,13 +17,15 @@ dependency between them, by design.
   from a cached copy in KV — geometry barely ever changes, and re-parsing it
   on every 5-min tick was the main cost behind a real CPU-budget failure on
   the Workers Free plan (see `worker/README.md`). Each 5-min tick also nudges
-  a running estimate of every path's own free-flow speed (95th percentile,
-  held in its own KV key) — exposed once a path has ~24h of samples, so the
-  app can colour a road relative to its *own* normal instead of one global
-  scale. Everything gets joined into one JSON snapshot in Workers KV.
-  Refuses to overwrite/serve a snapshot that comes back suspiciously empty
-  (e.g. from a broken upstream feed) — keeps the last known-good data (and
-  the free-flow estimates) live instead of silently blanking or corrupting
+  two running estimates for every path, held together in one KV value: its
+  own free-flow speed (95th percentile, exposed after ~24h of samples, so the
+  app can colour a road relative to its *own* normal) and a typical speed for
+  each 30-minute slot of the Nicosia day, kept separately for weekdays and
+  weekends/public holidays (median, exposed after 18 readings — about three
+  matching days). Everything gets joined into one JSON snapshot in Workers
+  KV. Refuses to overwrite/serve a snapshot that comes back suspiciously
+  empty (e.g. from a broken upstream feed) — keeps the last known-good data
+  (and what it has learned) live instead of silently blanking or corrupting
   them. The `fetch` handler serves that snapshot directly at `/latest.json`
   — no build, no deploy, no CDN cache lag between a poll and the app seeing
   it. A manual `/refresh` (forces an immediate full refresh) is gated behind
@@ -35,7 +37,9 @@ dependency between them, by design.
   relative to each road's own learned free-flow speed once the Worker has
   enough history for it, falling back to a general fast/moderate/slow scale
   otherwise (light/dark basemap follows system theme by default, with a
-  manual override toggle), plus
+  manual override toggle). Tapping a road shows its speed, how that compares
+  with what is typical for this time of day (the Anomaly Indicator,
+  I = typical ÷ speed × 100, in provisional bands) and with free flow. Also
   toggleable, clustered layers for road closures, hazards/accidents,
   crowdsourced jams, and official road works — each with a mobile-style
   bottom sheet (swipe-to-dismiss) on tap, showing which feed it came from.
