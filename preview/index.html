@@ -639,6 +639,11 @@ const PALETTE = { fast: '#2ecc71', moderate: '#f1c40f', slow: '#e74c3c' };
 const RELATIVE_FAST = 0.75;
 const RELATIVE_MODERATE = 0.5;
 
+// TODO: map colours still follow speed relative to free flow only. Colouring
+// by the Anomaly Indicator / its Level-of-Service bands (see describeAnomaly,
+// which currently only feeds the road sheet's text) is deliberately left for
+// later, once the bands are calibrated.
+//
 // freeFlow is null until the Worker's estimate for that path has enough
 // samples to be trustworthy (see MIN_BASELINE_SAMPLES in worker.js), and
 // stays null for roads whose sensor never reports. Both fall back to the
@@ -859,20 +864,60 @@ function formatTravelTime(seconds) {
 // opposite things on a motorway and a side street. Where a learned free-flow
 // speed exists, say so in words rather than making the reader infer it from
 // the line's colour.
+//
+// Free flow is the speed a road reaches when nothing is in the way — not what
+// is normal at rush hour — so this is worded as a comparison with free flow,
+// and "usual for this time" is left to describeAnomaly below.
 function describeRelativeSpeed(speed, freeFlow) {
   if (freeFlow == null || freeFlow <= 0) return null;
   const ratio = speed / freeFlow;
-  const label = ratio >= RELATIVE_FAST ? 'Flowing normally'
-    : ratio >= RELATIVE_MODERATE ? 'Slower than usual'
-    : 'Much slower than usual';
-  return `${label} · usually ~${Math.round(freeFlow)} km/h here`;
+  const label = ratio >= RELATIVE_FAST ? 'Near free flow'
+    : ratio >= RELATIVE_MODERATE ? 'Slower than free flow'
+    : 'Much slower than free flow';
+  return `${label} · free flow ~${Math.round(freeFlow)} km/h`;
 }
 
-function openSheet(speed, travelTimeS, freeFlowKmh) {
+// Anomaly Indicator: how today's reading compares with what is typical for
+// this road at this time of day and kind of day (the Worker's typical_kmh):
+//
+//   I_anom = t_obs / t_his * 100
+//
+// On a fixed-length path travel time is length / speed, so this is just
+// typical_speed / current_speed * 100. 100 means exactly as usual; above 100
+// the road is slower than usual, below 100 faster.
+//
+// PROVISIONAL — the Level-of-Service bands below are a first guess and will
+// be calibrated later. They live here, as the only place that interprets the
+// index, because the Worker publishes only the raw typical_kmh: recalibrating
+// is an edit to these three numbers, with nothing to change or migrate on the
+// Worker side.
+const ANOMALY_MUCH_SLOWER = 150; // index >= this: much slower than usual
+const ANOMALY_SLOWER = 125;      // index >= this: slower than usual
+const ANOMALY_FASTER = 90;       // index <= this: faster than usual
+
+// null when there is nothing to compare with: typical_kmh is null while a slot
+// is still warming up, and absent (undefined) from older cached snapshots and
+// from the old Python poller's output.
+function describeAnomaly(speed, typical) {
+  if (typical == null || !(typical > 0)) return null;
+  // A stopped road (speed 0) is an infinitely large index, i.e. the slowest band.
+  const index = speed > 0 ? (typical / speed) * 100 : Infinity;
+  const label = index >= ANOMALY_MUCH_SLOWER ? 'Much slower than usual for this time'
+    : index >= ANOMALY_SLOWER ? 'Slower than usual for this time'
+    : index <= ANOMALY_FASTER ? 'Faster than usual for this time'
+    : 'Usual for this time';
+  // Non-breaking spaces keep "~45 km/h now" together, so on a narrow phone the
+  // line wraps before the number rather than stranding "now" on its own line.
+  return `${label} · typically ~${Math.round(typical)} km/h now`;
+}
+
+function openSheet(speed, travelTimeS, freeFlowKmh, typicalKmh) {
   const travel = formatTravelTime(travelTimeS);
-  const context = (speed != null && speed >= 0) ? describeRelativeSpeed(speed, freeFlowKmh) : null;
-  sheetBody.innerHTML = (speed != null && speed >= 0)
-    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>${context ? `<div class="sheet-context">${escapeHtml(context)}</div>` : ''}${travel ? `<div class="sheet-meta">~${travel} travel time</div>` : ''}`
+  const hasSpeed = speed != null && speed >= 0;
+  const anomaly = hasSpeed ? describeAnomaly(speed, typicalKmh) : null;
+  const context = hasSpeed ? describeRelativeSpeed(speed, freeFlowKmh) : null;
+  sheetBody.innerHTML = hasSpeed
+    ? `<div class="sheet-speed">${speed}<span class="unit">km/h</span></div>${anomaly ? `<div class="sheet-context">${escapeHtml(anomaly)}</div>` : ''}${context ? `<div class="sheet-context">${escapeHtml(context)}</div>` : ''}${travel ? `<div class="sheet-meta">~${travel} travel time</div>` : ''}`
     : `<div class="sheet-nodata">No live data for this road</div>`;
   showSheet();
 }
@@ -1288,6 +1333,7 @@ function loadData() {
           entry.hit.speedKmh = p.speed_kmh;
           entry.hit.travelTimeS = p.travel_time_s;
           entry.hit.freeFlowKmh = p.free_flow_kmh;
+          entry.hit.typicalKmh = p.typical_kmh ?? null; // absent in older snapshots / the poller's output
         } else {
           // Two lines per road: a thin visible one (what you see) and a much
           // wider invisible one on top of it (what actually catches taps) —
@@ -1303,10 +1349,11 @@ function loadData() {
           hit.speedKmh = p.speed_kmh;
           hit.travelTimeS = p.travel_time_s;
           hit.freeFlowKmh = p.free_flow_kmh;
+          hit.typicalKmh = p.typical_kmh ?? null;
           hit.on('click', (e) => {
             L.DomEvent.stopPropagation(e); // don't let this bubble to the map's own click-to-close handler
             haptic();
-            openSheet(hit.speedKmh, hit.travelTimeS, hit.freeFlowKmh);
+            openSheet(hit.speedKmh, hit.travelTimeS, hit.freeFlowKmh, hit.typicalKmh);
           });
           entry = { visible, hit, color: newColor };
           layersById.set(p.id, entry);
