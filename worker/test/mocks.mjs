@@ -72,6 +72,8 @@ export class FakeUpstream {
     this.speedOf = speedOf;
     this.measuredAt = '2026-10-14T10:00:00.0000000Z';
     this.live = { status: 200 }; // override status to simulate an upstream error
+    this.situationsXml = EMPTY_FEED; // body served for SituationPublication
+    this.wazeAlertsXml = EMPTY_FEED; // body served for waze_alerts
     this.requests = [];
     this._original = null;
   }
@@ -88,6 +90,10 @@ export class FakeUpstream {
         body = liveXml(this.ids, this.speedOf, this.measuredAt);
       } else if (u.includes('PredefinedLocationPublication')) {
         body = geometryXml(this.ids);
+      } else if (u.includes('SituationPublication')) {
+        body = this.situationsXml;
+      } else if (u.includes('waze_alerts')) {
+        body = this.wazeAlertsXml;
       }
       return { ok: status >= 200 && status < 300, status, text: async () => body };
     };

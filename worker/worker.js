@@ -48,6 +48,10 @@ const INTERMEDIATE_POINT_RE = /<location:intermediatePointCoordinates>\s*<common
 // description, and a point location.
 const SITUATION_RECORD_RE = /<q1:situationRecord xsi:type="q1:([^"]+)"\s+id="([^"]+)"[^>]*>([\s\S]*?)<\/q1:situationRecord>/g;
 const SEVERITY_RE = /<q1:severity>([^<]*)<\/q1:severity>/;
+// Who originated the record: "Operator" for the authority's own entries,
+// "Waze" for incidents it relays from Waze. The element carries an xmlns
+// attribute, hence the [^>]*.
+const SOURCE_RE = /<q1:source>\s*<sourceIdentification[^>]*>([^<]*)<\/sourceIdentification>/;
 const DESCRIPTION_RE = /<description[^>]*>([^<]*)<\/description>/;
 // Each situationRecord declares its own incrementing XML namespace prefix
 // (q2, q3, q4, ...) for its locationReference, so the prefix on <N:latitude>
@@ -295,12 +299,14 @@ function parseSituations(text) {
     const pointMatch = SITUATION_POINT_RE.exec(block);
     if (!pointMatch) continue;
     const severityMatch = SEVERITY_RE.exec(block);
+    const sourceMatch = SOURCE_RE.exec(block);
     const descMatch = DESCRIPTION_RE.exec(block);
     const startMatch = OVERALL_START_RE.exec(block);
     const endMatch = OVERALL_END_RE.exec(block);
     situations.push({
       id,
       type: recordType,
+      source: sourceMatch ? unescapeXml(sourceMatch[1]).trim() || null : null,
       severity: severityMatch ? severityMatch[1] : null,
       description: descMatch ? unescapeXml(descMatch[1]) : null,
       starts_at: startMatch ? startMatch[1] : null,
@@ -310,6 +316,34 @@ function parseSituations(text) {
     });
   }
   return situations;
+}
+
+// The official feed relays some Waze incidents (see SOURCE_RE), and the same
+// incident can also arrive from waze_alerts — drawn as is, it would be two
+// markers on one spot. A relayed record is the same incident as an alert when
+// the alert's report_time equals the record's overallStartTime to the second
+// and the two points are within WAZE_TWIN_MAX_KM; in live data that matched
+// exactly to the second, with the points ~20 cm apart. Only records declared
+// as Waze-sourced are ever dropped: an operator-entered record is the
+// authority's own and is always kept, as is anything whose source is missing
+// or unknown. Where the match is uncertain (a timestamp with fractional
+// seconds, say) the record is kept — a doubled marker beats a lost incident.
+const WAZE_TWIN_MAX_KM = 0.1;
+
+function dropWazeTwins(situations, alerts) {
+  if (!alerts.length) return situations;
+  const byTime = new Map();
+  for (const a of alerts) {
+    if (!a.report_time || a.lat == null || a.lon == null) continue;
+    if (!byTime.has(a.report_time)) byTime.set(a.report_time, []);
+    byTime.get(a.report_time).push(a);
+  }
+  return situations.filter((s) => {
+    if (s.source !== "Waze" || !s.starts_at) return true;
+    const sameSecond = byTime.get(s.starts_at.replace("T", " "));
+    if (!sameSecond) return true;
+    return !sameSecond.some((a) => haversineKm([s.lat, s.lon], [a.lat, a.lon]) <= WAZE_TWIN_MAX_KM);
+  });
 }
 
 // Fetches one feed and applies `parse`, but never lets a failure here take
@@ -812,6 +846,7 @@ async function buildSnapshot(env, { refreshGeometry = false, nowMs = Date.now() 
 
   const live = parseLive(liveText);
   const { alerts, road_closures } = groupRoadClosures(alertsRaw);
+  const officialSituations = dropWazeTwins(situations, alerts);
 
   const paths = [];
   for (const [pid, geo] of geometry) {
@@ -892,7 +927,7 @@ async function buildSnapshot(env, { refreshGeometry = false, nowMs = Date.now() 
     alerts,
     road_closures,
     jams,
-    situations,
+    situations: officialSituations,
   };
 
   return {
