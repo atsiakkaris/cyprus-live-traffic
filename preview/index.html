@@ -974,6 +974,10 @@ function alertStyle(type) {
 function situationStyle(type) {
   if (type === 'VehicleObstruction') return { color: '#c0392b', icon: 'barricade', label: 'Obstruction' };
   if (type === 'GenericSituationRecord') return { color: '#7f8c8d', icon: 'siren', label: 'Incident' };
+  // The official feed does carry Accident records. They used to fall through
+  // to the default below and showed up as "Road works" with an excavator;
+  // same look as the Waze accident marker now.
+  if (type === 'Accident') return { color: '#d90429', icon: 'carBurst', label: 'Accident' };
   return { color: '#e67e22', icon: 'excavator', label: 'Road works' }; // Maintenance/Construction/LaneManagement
 }
 
@@ -1020,9 +1024,22 @@ function reportMarker(lat, lon, color, symbol, onClick, targetLayer) {
   return marker;
 }
 
+// Waze subtypes repeat the type as a prefix (HAZARD_ON_SHOULDER_CAR_STOPPED
+// under type HAZARD), so the title used to read "Hazard — hazard on shoulder
+// car stopped". Drop the prefix: "Hazard — on shoulder car stopped".
+function alertSubtypeText(a) {
+  if (!a.subtype) return '';
+  let sub = a.subtype;
+  if (a.type) {
+    if (sub === a.type) return '';
+    if (sub.startsWith(a.type + '_')) sub = sub.slice(a.type.length + 1);
+  }
+  return sub.replace(/_/g, ' ').toLowerCase();
+}
+
 function openAlertSheet(a) {
   const s = alertStyle(a.type);
-  const sub = a.subtype ? escapeHtml(a.subtype.replace(/_/g, ' ').toLowerCase()) : '';
+  const sub = escapeHtml(alertSubtypeText(a));
   sheetBody.innerHTML = `
     <div class="sheet-title">${iconSvg(s.icon, { size: 20, fill: s.color })} ${s.label}${sub ? ' — ' + sub : ''}</div>
     ${a.street ? `<div class="sheet-sub">${escapeHtml(a.street)}</div>` : ''}
@@ -1042,6 +1059,23 @@ function openJamSheet(j) {
   showSheet();
 }
 
+// The official feed relays some Waze incidents alongside the authority's own
+// entries, and each record declares which it is (worker.js SOURCE_RE). Naming
+// the true origin matters: "official" on a crowdsourced report overstates it.
+// A missing source (an older cached snapshot) keeps the previous wording.
+function situationSourceLabel(sit) {
+  if (sit.source === 'Waze') return 'Waze (via traffic4cyprus)';
+  if (sit.source && sit.source !== 'Operator') return `traffic4cyprus (${escapeHtml(sit.source)})`;
+  return 'traffic4cyprus (official)';
+}
+
+// Accident records, from either source, belong with the Hazards/accidents
+// toggle. Everything else the feed carries (works, obstructions, traffic
+// arrangements) is works-style and stays under Road works.
+function situationLayer(sit) {
+  return sit.type === 'Accident' ? filterLayers.hazards : filterLayers.works;
+}
+
 function openSituationSheet(sit) {
   const s = situationStyle(sit.type);
   const period = sit.starts_at
@@ -1051,7 +1085,7 @@ function openSituationSheet(sit) {
     <div class="sheet-title">${iconSvg(s.icon, { size: 20, fill: s.color })} ${s.label}</div>
     ${sit.description ? `<div class="sheet-sub">${escapeHtml(sit.description)}</div>` : ''}
     ${period ? `<div class="sheet-meta">${period}</div>` : ''}
-    <div class="sheet-source">Source: traffic4cyprus (official)</div>
+    <div class="sheet-source">Source: ${situationSourceLabel(sit)}</div>
   `;
   showSheet();
 }
@@ -1465,12 +1499,15 @@ function loadData() {
         seenSituationIds.add(sit.id);
         if (situationsById.has(sit.id)) return; // same rationale as alerts above
         const s = situationStyle(sit.type);
-        const marker = reportMarker(sit.lat, sit.lon, s.color, iconSvg(s.icon, { size: 17 }), () => openSituationSheet(sit), filterLayers.works);
-        situationsById.set(sit.id, marker);
+        // Stored with its layer, like alerts: which toggle a record belongs
+        // to varies per record, so cleanup has to know where it was put.
+        const layer = situationLayer(sit);
+        const marker = reportMarker(sit.lat, sit.lon, s.color, iconSvg(s.icon, { size: 17 }), () => openSituationSheet(sit), layer);
+        situationsById.set(sit.id, { marker, layer });
       });
-      for (const [id, marker] of situationsById) {
+      for (const [id, entry] of situationsById) {
         if (!seenSituationIds.has(id)) {
-          fadeOutMarker(filterLayers.works, marker);
+          fadeOutMarker(entry.layer, entry.marker);
           situationsById.delete(id);
         }
       }
