@@ -1078,11 +1078,26 @@ export default {
       );
       return;
     }
-    const { snapshot, state, flush, staleness } = await buildSnapshot(env, {
-      refreshGeometry: event.cron === GEOMETRY_CRON,
-      nowMs,
-    });
-    await storeIfHealthy(env, snapshot, state, staleness, flush);
+    // Counts the puts this tick actually makes (the worker only uses get/put on
+    // the binding), to check the logs against the 1,000-a-day write budget.
+    const putKeys = [];
+    const kv = env.TRAFFIC_KV;
+    const counted = {
+      ...env,
+      TRAFFIC_KV: {
+        get: (...a) => kv.get(...a),
+        put: (key, ...a) => (putKeys.push(key), kv.put(key, ...a)),
+      },
+    };
+    try {
+      const { snapshot, state, flush, staleness } = await buildSnapshot(counted, {
+        refreshGeometry: event.cron === GEOMETRY_CRON,
+        nowMs,
+      });
+      await storeIfHealthy(counted, snapshot, state, staleness, flush);
+    } finally {
+      console.log(`KV puts this tick: ${putKeys.length} [${putKeys.join(", ")}]`);
+    }
   },
 
   async fetch(request, env) {
