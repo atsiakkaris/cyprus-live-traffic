@@ -1399,6 +1399,42 @@ function hideLoadingOverlay() {
 setTimeout(() => { tilesReady = true; maybeRevealMap(); }, 4000);
 
 const layersById = new Map();
+
+// The feed gives each road one path per direction ("1007->1008" and
+// "1008->1007") with the same line, so drawn as-is the second hides the first.
+// A path whose reverse is also in the feed is drawn shifted sideways, to the
+// left of its direction of travel (Cyprus drives on the left), so both show.
+// The shift is in screen pixels, not metres: the lines are a fixed width, so a
+// fixed gap keeps them side by side at every zoom. Paths with no reverse
+// (one-way roads) stay on the centre line.
+const DIRECTION_OFFSET_PX = 3;
+function offsetLatLngs(latlngs, px) {
+  if (!px) return latlngs;
+  const z = map.getZoom();
+  const pts = latlngs.map((ll) => map.project(L.latLng(ll), z));
+  return pts.map((pt, i) => {
+    const a = pts[Math.max(i - 1, 0)];
+    const b = pts[Math.min(i + 1, pts.length - 1)];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (!len) return map.unproject(pt, z);
+    // Screen y points down, so the left of (dx, dy) is (dy, -dx).
+    return map.unproject(L.point(pt.x + (dy / len) * px, pt.y - (dx / len) * px), z);
+  });
+}
+function reverseName(name) {
+  const m = /^(.+)->(.+)$/.exec(name || '');
+  return m ? `${m[2]}->${m[1]}` : null;
+}
+map.on('zoomend', () => {
+  for (const entry of layersById.values()) {
+    if (!entry.offsetPx) continue;
+    const shifted = offsetLatLngs(entry.latlngs, entry.offsetPx);
+    entry.visible.setLatLngs(shifted);
+    entry.hit.setLatLngs(shifted);
+  }
+});
+
 const alertsById = new Map();
 const roadClosuresById = new Map();
 const jamsById = new Map();
@@ -1472,6 +1508,7 @@ function loadData() {
       hideLoadingOverlay();
       const bounds = [];
       const seenIds = new Set();
+      const feedNames = new Set(data.paths.map(p => p.name));
       data.paths.forEach(p => {
         if (!p.coords || p.coords.length < 2) return;
         seenIds.add(p.id);
@@ -1493,12 +1530,17 @@ function loadData() {
           // wider invisible one on top of it (what actually catches taps) —
           // the visible line alone is too thin a target to tap reliably,
           // especially zoomed out.
-          const visible = L.polyline(latlngs, {
+          const rev = reverseName(p.name);
+          const offsetPx = rev && feedNames.has(rev) ? DIRECTION_OFFSET_PX : 0;
+          const drawn = offsetLatLngs(latlngs, offsetPx);
+          const visible = L.polyline(drawn, {
             color: newColor, weight: 5, opacity: 0.85,
             interactive: false
           }).addTo(map);
-          const hit = L.polyline(latlngs, {
-            weight: 22, opacity: 0, interactive: true
+          // Narrower for a two-direction road, so a tap on one side picks that
+          // direction instead of whichever line was drawn last.
+          const hit = L.polyline(drawn, {
+            weight: offsetPx ? 14 : 22, opacity: 0, interactive: true
           }).addTo(map);
           hit.speedKmh = p.speed_kmh;
           hit.travelTimeS = p.travel_time_s;
@@ -1509,7 +1551,7 @@ function loadData() {
             haptic();
             openSheet(hit.speedKmh, hit.travelTimeS, hit.freeFlowKmh, hit.typicalKmh);
           });
-          entry = { visible, hit, color: newColor };
+          entry = { visible, hit, color: newColor, latlngs, offsetPx };
           layersById.set(p.id, entry);
         }
         latlngs.forEach(ll => bounds.push(ll));
