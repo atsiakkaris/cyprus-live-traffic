@@ -11,6 +11,10 @@ const BASE = "https://www.traffic4cyprus.org.cy/swarco3/api/Data";
 const GEOMETRY_URL = `${BASE}/PredefinedLocationPublication`;
 const LIVE_URL = `${BASE}/PredefinedLocationDataPublication`;
 const SITUATION_URL = `${BASE}/SituationPublication`;
+// Variable message signs: the inventory (name + position, effectively static)
+// and the live status of each controller.
+const VMS_TABLE_URL = `${BASE}/VmsTablePublication`;
+const VMS_URL = `${BASE}/VmsPublication`;
 
 const FIXCYPRUS_BASE = "https://fixcyprus.cy/gnosis/open/api/nap/datasets";
 const WAZE_ALERTS_URL = `${FIXCYPRUS_BASE}/waze_alerts/`;
@@ -59,6 +63,20 @@ const DESCRIPTION_RE = /<description[^>]*>([^<]*)<\/description>/;
 const SITUATION_POINT_RE = /<\w+:latitude>([^<]*)<\/\w+:latitude>\s*<\w+:longitude>([^<]*)<\/\w+:longitude>/;
 const OVERALL_START_RE = /<overallStartTime>([^<]*)<\/overallStartTime>/;
 const OVERALL_END_RE = /<overallEndTime>([^<]*)<\/overallEndTime>/;
+
+// VmsTablePublication: one <q1:vmsController id="N"> per sign (all 43 seen so
+// far hold exactly one vms), with an English description and a point location.
+// Like the situation records, each controller declares its own namespace
+// prefix (q2, q3, ...) for the location, so SITUATION_POINT_RE's generic
+// prefix match is reused for the coordinates.
+const VMS_CONTROLLER_RE = /<q1:vmsController id="([^"]+)"[^>]*>([\s\S]*?)<\/q1:vmsController>/g;
+// VmsPublication: one <q1:vmsControllerStatus> per controller. The first
+// statusUpdateTime in a block is the controller's own; the workingStatus is
+// absent for controllers that report no status at all.
+const VMS_STATUS_RE = /<q1:vmsControllerStatus>([\s\S]*?)<\/q1:vmsControllerStatus>/g;
+const VMS_REF_RE = /<q1:vmsControllerReference[^>]*\bid="([^"]+)"/;
+const VMS_WORKING_RE = /<q1:workingStatus>([^<]*)<\/q1:workingStatus>/;
+const VMS_UPDATED_RE = /<q1:statusUpdateTime>([^<]*)<\/q1:statusUpdateTime>/;
 
 // Hoisted rather than written as literals inside the per-element parse loops
 // below — those run hundreds of times per tick, and the CPU budget here is
@@ -401,6 +419,12 @@ const MIN_HEALTHY_LIVE_RATIO = 0.75;
 // caused the exceededCpu failures. If those come back, this is the first
 // thing to flip off again.
 const FETCH_EVENTS = true;
+
+// Variable message signs: a second small feed per tick plus the cached
+// inventory. Same kill switch idea as FETCH_EVENTS if CPU ever becomes a
+// problem. VMS_INVENTORY_KEY is the one extra KV key this feature adds.
+const FETCH_VMS = true;
+const VMS_INVENTORY_KEY = "vms_inventory";
 
 // --- Free-flow baselines ---------------------------------------------------
 //
@@ -829,22 +853,105 @@ async function loadGeometry(env) {
   return fetchAndCacheGeometry(env);
 }
 
+// --- Variable message signs ------------------------------------------------
+// Inventory: [{ id, name, lat, lon }]. A controller with no usable position is
+// skipped, since the app could not place it anyway.
+function parseVmsInventory(text) {
+  const signs = [];
+  for (const m of text.matchAll(VMS_CONTROLLER_RE)) {
+    const block = m[2];
+    const point = SITUATION_POINT_RE.exec(block);
+    if (!point) continue;
+    const lat = parseFloat(point[1]);
+    const lon = parseFloat(point[2]);
+    if (Number.isNaN(lat) || Number.isNaN(lon)) continue;
+    const nameMatch = NAME_RE.exec(block);
+    signs.push({ id: m[1], name: nameMatch ? unescapeXml(nameMatch[1]).trim() : m[1], lat, lon });
+  }
+  return signs;
+}
+
+// Live status: [{ id, status, updated_at }]. `status` is the feed's own word
+// ("working", "notWorking", ...) or null when the controller reports none;
+// `updated_at` is Nicosia local time written without an offset, as published.
+// What a sign is displaying is deliberately not read yet: every message in the
+// feed so far is an empty text display, so there is no sample to build on.
+function parseVmsStatus(text) {
+  const out = [];
+  for (const m of text.matchAll(VMS_STATUS_RE)) {
+    const ref = VMS_REF_RE.exec(m[1]);
+    if (!ref) continue;
+    const working = VMS_WORKING_RE.exec(m[1]);
+    const updated = VMS_UPDATED_RE.exec(m[1]);
+    out.push({
+      id: ref[1],
+      status: working ? working[1].trim() || null : null,
+      updated_at: updated ? updated[1].trim() || null : null,
+    });
+  }
+  return out;
+}
+
+// The inventory lives under its own key rather than inside `geometry`: that
+// value is a list of path entries read on every tick, and a changed shape could
+// break the cache read. It is only written when the fetched list differs from
+// what is stored, so on a normal day this costs no writes at all.
+async function readVmsInventory(env) {
+  const cached = await env.TRAFFIC_KV.get(VMS_INVENTORY_KEY);
+  if (!cached) return null;
+  try {
+    const parsed = JSON.parse(cached);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchAndCacheVmsInventory(env) {
+  const previous = await env.TRAFFIC_KV.get(VMS_INVENTORY_KEY);
+  try {
+    const signs = parseVmsInventory(await fetchText(VMS_TABLE_URL));
+    // An empty list is a broken fetch, not a network with no signs: keep what
+    // is stored rather than overwrite it with nothing.
+    if (!signs.length) throw new Error("no signs parsed");
+    const json = JSON.stringify(signs);
+    if (json !== previous) await env.TRAFFIC_KV.put(VMS_INVENTORY_KEY, json);
+    return signs;
+  } catch (err) {
+    console.error(`Failed to refresh the VMS inventory: ${err}`);
+    return (await readVmsInventory(env)) || [];
+  }
+}
+
+async function loadVmsInventory(env) {
+  return (await readVmsInventory(env)) || fetchAndCacheVmsInventory(env);
+}
+
 // Returns the snapshot plus the updated learned state rather than writing the
 // latter itself: learned state must only be persisted alongside a snapshot
 // that passes the health checks, so that a broken upstream feed can't quietly
 // teach every road a wrong idea of normal. storeIfHealthy owns all the writes.
 async function buildSnapshot(env, { refreshGeometry = false, nowMs = Date.now() } = {}) {
-  const [geometry, liveText, alertsRaw, jams, situations, prevState, prevStaleness] = await Promise.all([
+  const [geometry, liveText, alertsRaw, jams, situations, vmsInventory, vmsLive, prevState, prevStaleness] = await Promise.all([
     refreshGeometry ? fetchAndCacheGeometry(env) : loadGeometry(env),
     fetchText(LIVE_URL),
     FETCH_EVENTS ? fetchAndParse(WAZE_ALERTS_URL, parseWazeAlerts, "waze_alerts") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(WAZE_TRAFFIC_URL, parseWazeTraffic, "waze_traffic") : Promise.resolve([]),
     FETCH_EVENTS ? fetchAndParse(SITUATION_URL, parseSituations, "SituationPublication") : Promise.resolve([]),
+    FETCH_VMS ? (refreshGeometry ? fetchAndCacheVmsInventory(env) : loadVmsInventory(env)) : Promise.resolve([]),
+    FETCH_VMS ? fetchAndParse(VMS_URL, parseVmsStatus, "VmsPublication") : Promise.resolve([]),
     readState(env),
     readStaleness(env),
   ]);
 
   const live = parseLive(liveText);
+  // Every sign in the inventory is listed; a failed or missing live feed just
+  // leaves status and updated_at null rather than dropping the sign.
+  const vmsStatusById = new Map(vmsLive.map((s) => [s.id, s]));
+  const vms = vmsInventory.map((sign) => {
+    const s = vmsStatusById.get(sign.id);
+    return { ...sign, status: s ? s.status : null, updated_at: s ? s.updated_at : null };
+  });
   const { alerts, road_closures } = groupRoadClosures(alertsRaw);
   const officialSituations = dropWazeTwins(situations, alerts);
 
@@ -928,6 +1035,7 @@ async function buildSnapshot(env, { refreshGeometry = false, nowMs = Date.now() 
     road_closures,
     jams,
     situations: officialSituations,
+    vms,
   };
 
   return {

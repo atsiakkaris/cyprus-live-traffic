@@ -74,6 +74,10 @@ export class FakeUpstream {
     this.live = { status: 200 }; // override status to simulate an upstream error
     this.situationsXml = EMPTY_FEED; // body served for SituationPublication
     this.wazeAlertsXml = EMPTY_FEED; // body served for waze_alerts
+    this.vmsTableXml = EMPTY_FEED; // body served for VmsTablePublication
+    this.vmsLiveXml = EMPTY_FEED; // body served for VmsPublication
+    this.vmsTable = { status: 200 }; // override status to simulate an upstream error
+    this.vmsLive = { status: 200 };
     this.requests = [];
     this._original = null;
   }
@@ -90,6 +94,12 @@ export class FakeUpstream {
         body = liveXml(this.ids, this.speedOf, this.measuredAt);
       } else if (u.includes('PredefinedLocationPublication')) {
         body = geometryXml(this.ids);
+      } else if (u.includes('VmsTablePublication')) {
+        status = this.vmsTable.status;
+        body = this.vmsTableXml;
+      } else if (u.includes('VmsPublication')) {
+        status = this.vmsLive.status;
+        body = this.vmsLiveXml;
       } else if (u.includes('SituationPublication')) {
         body = this.situationsXml;
       } else if (u.includes('waze_alerts')) {
