@@ -77,6 +77,11 @@ const VMS_STATUS_RE = /<q1:vmsControllerStatus>([\s\S]*?)<\/q1:vmsControllerStat
 const VMS_REF_RE = /<q1:vmsControllerReference[^>]*\bid="([^"]+)"/;
 const VMS_WORKING_RE = /<q1:workingStatus>([^<]*)<\/q1:workingStatus>/;
 const VMS_UPDATED_RE = /<q1:statusUpdateTime>([^<]*)<\/q1:statusUpdateTime>/;
+// A displayed message, as the feed writes it (seen 2026-11-16): one
+// <q1:textLine lineIndex="N"> per line, wrapping a second <q1:textLine>, which
+// wraps a third that holds the text — or is self-closing when the line is
+// blank. Matched on the two outer wrappers plus the innermost element.
+const VMS_TEXT_LINE_RE = /<\w+:textLine\b[^>]*\blineIndex="\d+"[^>]*>\s*<\w+:textLine>\s*(?:<\w+:textLine\s*\/>|<\w+:textLine>([^<]*)<\/\w+:textLine>)/g;
 
 // Hoisted rather than written as literals inside the per-element parse loops
 // below — those run hundreds of times per tick, and the CPU budget here is
@@ -874,8 +879,9 @@ function parseVmsInventory(text) {
 // Live status: [{ id, status, updated_at }]. `status` is the feed's own word
 // ("working", "notWorking", ...) or null when the controller reports none;
 // `updated_at` is Nicosia local time written without an offset, as published.
-// What a sign is displaying is deliberately not read yet: every message in the
-// feed so far is an empty text display, so there is no sample to build on.
+// `text` is what the sign is showing: its non-blank lines, in order, or null
+// when it is showing nothing. A pictogram, if any, is not read — the feed only
+// names a bitmap file for it, which says nothing a driver could use.
 function parseVmsStatus(text) {
   const out = [];
   for (const m of text.matchAll(VMS_STATUS_RE)) {
@@ -883,10 +889,16 @@ function parseVmsStatus(text) {
     if (!ref) continue;
     const working = VMS_WORKING_RE.exec(m[1]);
     const updated = VMS_UPDATED_RE.exec(m[1]);
+    const lines = [];
+    for (const l of m[1].matchAll(VMS_TEXT_LINE_RE)) {
+      const line = l[1] ? unescapeXml(l[1]).trim() : "";
+      if (line) lines.push(line);
+    }
     out.push({
       id: ref[1],
       status: working ? working[1].trim() || null : null,
       updated_at: updated ? updated[1].trim() || null : null,
+      text: lines.length ? lines : null,
     });
   }
   return out;
@@ -950,7 +962,7 @@ async function buildSnapshot(env, { refreshGeometry = false, nowMs = Date.now() 
   const vmsStatusById = new Map(vmsLive.map((s) => [s.id, s]));
   const vms = vmsInventory.map((sign) => {
     const s = vmsStatusById.get(sign.id);
-    return { ...sign, status: s ? s.status : null, updated_at: s ? s.updated_at : null };
+    return { ...sign, status: s ? s.status : null, updated_at: s ? s.updated_at : null, text: s ? s.text : null };
   });
   const { alerts, road_closures } = groupRoadClosures(alertsRaw);
   const officialSituations = dropWazeTwins(situations, alerts);

@@ -1225,18 +1225,23 @@ function openSituationSheet(sit) {
   showSheet();
 }
 
-// The Worker does not publish what a sign is displaying (every message in the
-// feed is an empty text display), so this says what is known — whether the
-// controller reports itself as working and when it last said so — and is
-// upfront about the rest instead of implying a blank sign.
+// `sign.text` is the sign's non-blank lines, or null when it shows nothing. It
+// is undefined in a snapshot from before the Worker published it, which is
+// told apart from "nothing displayed" so an old snapshot is not read as blank.
+function signMessageHtml(sign) {
+  if (sign.text === undefined) return `<div class="sheet-context">What the sign is displaying isn't available.</div>`;
+  if (!sign.text) return `<div class="sheet-context">Nothing is being displayed.</div>`;
+  return `<div class="sheet-sub" style="font-weight:600">${sign.text.map(escapeHtml).join('<br>')}</div>`;
+}
+
 function openSignSheet(sign) {
   const s = signStyle(sign.status);
   const w = wallTime(sign.updated_at);
   sheetBody.innerHTML = `
     <div class="sheet-title">${iconSvg(s.icon, { size: 20, fill: s.color })} ${escapeHtml(sign.name)}</div>
     <div class="sheet-sub">Variable message sign · ${s.label}</div>
+    ${signMessageHtml(sign)}
     ${w ? `<div class="sheet-meta">Status as of ${escapeHtml(dayWord(w, nicosiaNowIso()))}, ${escapeHtml(w.time)}</div>` : ''}
-    <div class="sheet-context">What the sign is displaying isn't available.</div>
     <div class="sheet-source">Source: traffic4cyprus (VMS feed)</div>
   `;
   showSheet();
@@ -1719,21 +1724,24 @@ function loadData() {
       }
 
       // Variable message signs (absent from snapshots older than the Worker
-      // change that added them). Redrawn only when a sign's status changes,
-      // like the situations above.
+      // change that added them). Redrawn only when a sign's status or message
+      // changes, like the situations above.
       const seenSignIds = new Set();
       (data.vms || []).forEach(sign => {
         if (sign.lat == null || sign.lon == null) return;
         seenSignIds.add(sign.id);
         const existing = signsById.get(sign.id);
-        if (existing && existing.status === sign.status) return;
+        // The marker's tap handler holds this sign's data, so a changed
+        // message needs a redraw as much as a changed status does.
+        const key = `${sign.status}|${JSON.stringify(sign.text ?? null)}`;
+        if (existing && existing.key === key) return;
         if (existing) filterLayers.signs.removeLayer(existing.marker);
         const s = signStyle(sign.status);
         const marker = reportMarker(
           sign.lat, sign.lon, s.color, iconSvg(s.icon, { size: 17 }),
           () => openSignSheet(sign), filterLayers.signs
         );
-        signsById.set(sign.id, { marker, status: sign.status });
+        signsById.set(sign.id, { marker, key });
       });
       for (const [id, entry] of signsById) {
         if (!seenSignIds.has(id)) {

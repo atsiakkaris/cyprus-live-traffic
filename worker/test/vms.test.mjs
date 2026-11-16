@@ -45,10 +45,83 @@ test('parseVmsInventory skips a controller with no usable position', () => {
 
 test('parseVmsStatus reads status and update time; a missing status is null', () => {
   assert.deepStrictEqual(w.parseVmsStatus(LIVE), [
-    { id: '7', status: 'working', updated_at: '2026-11-16T11:05:21.333' },
-    { id: '8', status: 'notWorking', updated_at: '2026-11-16T11:05:21.35' },
-    { id: '9', status: null, updated_at: '2026-11-16T11:05:21.333' },
+    { id: '7', status: 'working', updated_at: '2026-11-16T11:05:21.333', text: null },
+    { id: '8', status: 'notWorking', updated_at: '2026-11-16T11:05:21.35', text: null },
+    { id: '9', status: null, updated_at: '2026-11-16T11:05:21.333', text: null },
   ]);
+});
+
+// Copied from the live feed on 2026-11-16 (sign 10 showing a message): a
+// pictogram area with only a bitmap file name, then a text display of four
+// lines of which only the second has text.
+const MESSAGE_STATUS = `<q1:vmsControllerStatus>
+<q1:vmsControllerTableReference id="1.0" version="1.0" targetClass="vms:VmsControllerTable"/>
+<q1:vmsControllerReference id="10" version="1.0" targetClass="vms:VmsController"/>
+<q1:statusUpdateTime>2026-11-16T11:26:54.977</q1:statusUpdateTime>
+<q1:vmsStatus vmsIndex="1">
+<q1:vmsStatus>
+<q1:statusUpdateTime>2026-11-16T11:26:54.977</q1:statusUpdateTime>
+<q1:workingStatus>working</q1:workingStatus>
+<q1:vmsMessage messageIndex="0">
+<q1:vmsMessage>
+<q1:timeLastSet>0001-01-01T00:00:00</q1:timeLastSet>
+<q1:displayAreaSettings displayAreaIndex="0">
+<q1:displayAreaSettings xsi:type="q1:PictogramDisplay">
+<q1:pictogram xsi:type="q1:RegularPictogram">
+<q1:additionalDescription>
+<values xmlns="http://datex2.eu/schema/3/common">
+<value lang="en-US">pngtree-vector-phone-cell-icon-png-image_889619.bmp</value>
+</values>
+</q1:additionalDescription>
+</q1:pictogram>
+</q1:displayAreaSettings>
+</q1:displayAreaSettings>
+<q1:displayAreaSettings displayAreaIndex="0">
+<q1:displayAreaSettings xsi:type="q1:TextDisplay">
+<q1:textLine lineIndex="0">
+<q1:textLine>
+<q1:textLine/>
+</q1:textLine>
+</q1:textLine>
+<q1:textLine lineIndex="1">
+<q1:textLine>
+<q1:textLine>FixCYPRUS</q1:textLine>
+</q1:textLine>
+</q1:textLine>
+<q1:textLine lineIndex="2">
+<q1:textLine>
+<q1:textLine/>
+</q1:textLine>
+</q1:textLine>
+<q1:textLine lineIndex="3">
+<q1:textLine>
+<q1:textLine> </q1:textLine>
+</q1:textLine>
+</q1:textLine>
+</q1:displayAreaSettings>
+</q1:displayAreaSettings>
+</q1:vmsMessage>
+</q1:vmsMessage>
+</q1:vmsStatus>
+</q1:vmsStatus>
+</q1:vmsControllerStatus>`;
+
+test('parseVmsStatus reads the lines a sign is showing, dropping blank ones and the pictogram', () => {
+  assert.deepStrictEqual(w.parseVmsStatus(MESSAGE_STATUS), [
+    { id: '10', status: 'working', updated_at: '2026-11-16T11:26:54.977', text: ['FixCYPRUS'] },
+  ]);
+});
+
+test('several lines keep their order and XML escapes are undone', () => {
+  const line = (i, t) => `<q1:textLine lineIndex="${i}"><q1:textLine><q1:textLine>${t}</q1:textLine></q1:textLine></q1:textLine>`;
+  const xml = MESSAGE_STATUS.replace(/<q1:textLine lineIndex="0">[\s\S]*<\/q1:textLine>\s*<\/q1:displayAreaSettings>/,
+    line(0, 'ACCIDENT AHEAD') + line(1, 'SLOW &amp; CAREFUL') + line(2, '') + '</q1:displayAreaSettings>');
+  assert.deepStrictEqual(w.parseVmsStatus(xml)[0].text, ['ACCIDENT AHEAD', 'SLOW & CAREFUL']);
+});
+
+test('a sign whose lines are all blank has text null', () => {
+  const blank = MESSAGE_STATUS.replace('<q1:textLine>FixCYPRUS</q1:textLine>', '<q1:textLine/>');
+  assert.equal(w.parseVmsStatus(blank)[0].text, null);
 });
 
 test('the snapshot lists every sign from the inventory with its live status', async () => {
@@ -60,7 +133,7 @@ test('the snapshot lists every sign from the inventory with its live status', as
     assert.equal(vms.length, 3);
     assert.deepStrictEqual(vms[0], {
       id: '7', name: 'A2 Highway Larnaka-Nicosia (Lymbia)', lat: 35.00042, lon: 33.40133,
-      status: 'working', updated_at: '2026-11-16T11:05:21.333',
+      status: 'working', updated_at: '2026-11-16T11:05:21.333', text: null,
     });
     assert.equal(vms[2].status, null);
   });
