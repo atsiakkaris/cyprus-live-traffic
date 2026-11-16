@@ -1731,17 +1731,20 @@ function loadData() {
         if (sign.lat == null || sign.lon == null) return;
         seenSignIds.add(sign.id);
         const existing = signsById.get(sign.id);
-        // The marker's tap handler holds this sign's data, so a changed
-        // message needs a redraw as much as a changed status does.
+        // What the marker looks like depends on status and message only, so
+        // only a change in those redraws it. The sheet reads the latest copy
+        // of the sign at tap time (entry.sign, refreshed on every poll) rather
+        // than the one captured when the marker was drawn — otherwise its
+        // "Status as of" time would stay frozen at the draw time.
         const key = `${sign.status}|${JSON.stringify(sign.text ?? null)}`;
-        if (existing && existing.key === key) return;
+        if (existing && existing.key === key) { existing.sign = sign; return; }
         if (existing) filterLayers.signs.removeLayer(existing.marker);
         const s = signStyle(sign.status);
         const marker = reportMarker(
           sign.lat, sign.lon, s.color, iconSvg(s.icon, { size: 17 }),
-          () => openSignSheet(sign), filterLayers.signs
+          () => { const e = signsById.get(sign.id); if (e) openSignSheet(e.sign); }, filterLayers.signs
         );
-        signsById.set(sign.id, { marker, key });
+        signsById.set(sign.id, { marker, key, sign });
       });
       for (const [id, entry] of signsById) {
         if (!seenSignIds.has(id)) {
